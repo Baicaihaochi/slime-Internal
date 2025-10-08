@@ -996,6 +996,32 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Path to the custom function that will post process reward, by default it will be the normalization for grpo. "
                 ),
             )
+            # Response length penalty arguments
+            parser.add_argument(
+                "--enable-length-penalty",
+                action="store_true",
+                default=False,
+                help="Enable response length truncation penalty (similar to verl DAPO)",
+            )
+            parser.add_argument(
+                "--max-response-length",
+                type=int,
+                default=None,
+                help="Maximum allowed response length before applying penalty",
+            )
+            parser.add_argument(
+                "--length-penalty-buffer",
+                type=int,
+                default=50,
+                help="Buffer length for gradual penalty application",
+            )
+            parser.add_argument(
+                "--length-penalty-factor",
+                type=float,
+                default=1.0,
+                help="Penalty factor for response length truncation (higher = more penalty)",
+
+            )
             return parser
 
         def add_rollout_buffer_arguments(parser):

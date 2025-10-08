@@ -31,9 +31,14 @@ async def async_rm(args, sample: Sample, **kwargs):
     if args.custom_rm_path is not None:
         rm_function = load_function(args.custom_rm_path)
         return await rm_function(args, sample, **kwargs)
+<<<<<<< HEAD
 
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
+    # Check if this is evaluation mode - disable length penalty for evaluation
+    is_evaluation = kwargs.get('evaluation', False)
+    
     rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
+>>>>>>> b53a26c (add length penalty for deepscaler)
     response = sample.response
     label = sample.label
     if rm_type.startswith("boxed_"):
@@ -45,7 +50,7 @@ async def async_rm(args, sample: Sample, **kwargs):
     if rm_type == "remote_rm":
         return await remote_rm(args, sample)
     elif rm_type == "deepscaler":
-        return get_deepscaler_rule_based_reward(response, label)
+        return get_deepscaler_rule_based_reward(response, label, args=args, sample=sample, evaluation=is_evaluation)
     elif rm_type == "dapo":
         return compute_score_dapo(response, label)
     elif rm_type == "math":
