@@ -705,6 +705,26 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--lambd", type=float, default=1.0, help="PPO GAE lambd")
             parser.add_argument("--normalize-advantages", action="store_true", default=False)
             parser.add_argument(
+                "--high-entropy-token-filter",
+                action="store_true",
+                default=False,
+                help=(
+                    "Whether to apply policy gradient updates only to high-entropy tokens. "
+                    "Inspired by 'Beyond the 80/20 Rule: High-Entropy Minority Tokens Drive Effective RL for LLM Reasoning'. "
+                    "This focuses training on 'forking tokens' that steer reasoning directions."
+                ),
+            )
+            parser.add_argument(
+                "--entropy-percentile",
+                type=float,
+                default=0.2,
+                help=(
+                    "The percentile of highest-entropy tokens to retain for gradient updates when --high-entropy-token-filter is enabled. "
+                    "Default 0.2 means only the top 20%% highest-entropy tokens will receive gradients. "
+                    "According to the paper, 20%% achieves optimal balance between exploration and performance."
+                ),
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",

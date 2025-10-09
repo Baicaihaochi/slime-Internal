@@ -392,6 +392,66 @@ def policy_loss_function(
     )
 
     log_probs = log_probs_and_entropy["log_probs"]
+    entropy = log_probs_and_entropy["entropy"]
+
+    # Apply high-entropy token filtering if enabled
+    if getattr(args, 'high_entropy_token_filter', False):
+        entropy_percentile = getattr(args, 'entropy_percentile', 0.2)
+
+        # Concatenate all entropies and masks
+        all_entropy = torch.cat(entropy, dim=0)
+        loss_masks = batch["loss_masks"]
+
+        cp_size = mpu.get_context_parallel_world_size()
+        if cp_size == 1:
+            all_masks = torch.cat(loss_masks)
+        else:
+            mask_chunks = []
+            for i in range(len(entropy)):
+                total_len = total_lengths[i]
+                response_len = response_lengths[i]
+                prompt_len = total_len - response_len
+                _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len)
+
+                s0, e0 = token_offsets[0]
+                s1, e1 = token_offsets[1]
+                res_s0, res_e0 = max(0, s0 - prompt_len), max(0, e0 - prompt_len)
+                res_s1, res_e1 = max(0, s1 - prompt_len), max(0, e1 - prompt_len)
+
+                local_mask_parts = []
+                full_mask = loss_masks[i]
+                if res_e0 > res_s0:
+                    local_mask_parts.append(full_mask[res_s0:res_e0])
+                if res_e1 > res_s1:
+                    local_mask_parts.append(full_mask[res_s1:res_e1])
+
+                local_mask_chunk = (
+                    torch.cat(local_mask_parts) if local_mask_parts
+                    else torch.tensor([], device=all_entropy.device, dtype=full_mask.dtype)
+                )
+                mask_chunks.append(local_mask_chunk)
+            all_masks = torch.cat(mask_chunks)
+
+        # Compute entropy threshold from valid tokens only
+        if all_masks.sum() > 0:
+            valid_entropy = all_entropy[all_masks.bool()]
+            entropy_threshold = torch.quantile(valid_entropy, 1.0 - entropy_percentile)
+
+            # Create high-entropy mask
+            high_entropy_mask = (all_entropy >= entropy_threshold).float()
+
+            # Update loss_masks
+            chunk_lengths = [ent.size(0) for ent in entropy]
+            high_entropy_chunks = list(torch.split(high_entropy_mask, chunk_lengths))
+            batch["loss_masks"] = [
+                loss_mask * high_entropy_chunk
+                for loss_mask, high_entropy_chunk in zip(loss_masks, high_entropy_chunks)
+            ]
+
+            # Recompute sum_of_sample_mean with updated masks
+            sum_of_sample_mean = get_sum_of_sample_mean(
+                total_lengths, response_lengths, batch["loss_masks"], args.calculate_per_token_loss
+            )
 
     if args.advantage_estimator == "gspo":
         full_log_probs = [
