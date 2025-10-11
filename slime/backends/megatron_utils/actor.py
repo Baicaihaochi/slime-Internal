@@ -231,6 +231,19 @@ class MegatronTrainRayActor(TrainRayActor):
             with timer("data_preprocess"):
                 rollout_data = self._get_rollout_data(rollout_data_ref)
 
+                # Q-Tuning: Dynamic data pruning based on PPL and Entropy
+                if self.args.enable_q_tuning:
+                    with timer("q_tuning_pruning"):
+                        from slime.utils.q_tuning_pruner import QTuningPruner
+
+                        pruner = QTuningPruner(
+                            sample_keep_ratio=self.args.q_tuning_sample_keep_ratio,
+                            token_keep_ratio=self.args.q_tuning_token_keep_ratio,
+                            neighbor_lambda=self.args.q_tuning_neighbor_lambda,
+                            bisect_max_iter=self.args.q_tuning_bisect_max_iter,
+                        )
+                        rollout_data = pruner.prune_batch(self.model, rollout_data)
+
                 # Create data iterator for log_probs and train.
                 data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
 
