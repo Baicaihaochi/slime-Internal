@@ -40,6 +40,8 @@ class QTuningAnalyzer:
         sample_keep_ratio: float = 0.5,
         token_keep_ratio: float = 0.7,
         neighbor_lambda: float = 0.5,
+        ignore_special_tokens: bool = False,
+        special_token_pairs: List[Tuple[str, str]] = None,
     ):
         self.model_path = model_path
         self.data_path = data_path
@@ -50,7 +52,27 @@ class QTuningAnalyzer:
         self.token_keep_ratio = token_keep_ratio
         self.neighbor_lambda = neighbor_lambda
 
+        # Long CoT special token handling
+        self.ignore_special_tokens = ignore_special_tokens
+        self.special_token_pairs = special_token_pairs or [
+            ("<think>", "</think>"),
+            ("<answer>", "</answer>"),
+        ]
+
         print(f"Loading model from {model_path}...")
+
+        # Debug: Show how special tokens are tokenized
+        if self.ignore_special_tokens:
+            print("\nSpecial token tokenization preview:")
+            temp_tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
+            for start_tok, end_tok in self.special_token_pairs:
+                start_ids = temp_tokenizer.encode(start_tok, add_special_tokens=False)
+                end_ids = temp_tokenizer.encode(end_tok, add_special_tokens=False)
+                start_tokens = [temp_tokenizer.decode([tid]) for tid in start_ids]
+                end_tokens = [temp_tokenizer.decode([tid]) for tid in end_ids]
+                print(f"  {start_tok:20s} → {start_ids} = {start_tokens}")
+                print(f"  {end_tok:20s} → {end_ids} = {end_tokens}")
+            print()
         self.tokenizer = AutoTokenizer.from_pretrained(model_path, trust_remote_code=True)
 
         # Determine device
@@ -159,12 +181,143 @@ class QTuningAnalyzer:
         print(f"Collected {len(samples['math'])} math samples and {len(samples['code'])} code samples")
         return samples
 
-    def compute_ppl_and_entropy(self, sample: Dict) -> Tuple[float, float, List[float], List[float]]:
+    def _find_special_token_ranges(self, text: str) -> List[Tuple[int, int]]:
+        """
+        Find character ranges of special token pairs in text.
+        Returns list of (start_idx, end_idx) tuples to ignore.
+        """
+        ignore_ranges = []
+        for start_token, end_token in self.special_token_pairs:
+            start_idx = 0
+            while True:
+                start_pos = text.find(start_token, start_idx)
+                if start_pos == -1:
+                    break
+                end_pos = text.find(end_token, start_pos + len(start_token))
+                if end_pos == -1:
+                    # No matching end token, ignore from start to end of text
+                    ignore_ranges.append((start_pos, len(text)))
+                    break
+                else:
+                    # Found pair, ignore from start_token to end of end_token
+                    ignore_ranges.append((start_pos, end_pos + len(end_token)))
+                    start_idx = end_pos + len(end_token)
+
+        # Merge overlapping ranges
+        if ignore_ranges:
+            ignore_ranges.sort()
+            merged = [ignore_ranges[0]]
+            for start, end in ignore_ranges[1:]:
+                if start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return merged
+        return []
+
+    def _tokenize_special_markers(self) -> Dict[str, List[int]]:
+        """
+        Pre-tokenize special marker strings to get their token IDs.
+        Returns dict mapping marker string to token ID sequence.
+        """
+        marker_tokens = {}
+        for start_marker, end_marker in self.special_token_pairs:
+            # Tokenize without special tokens
+            start_ids = self.tokenizer.encode(start_marker, add_special_tokens=False)
+            end_ids = self.tokenizer.encode(end_marker, add_special_tokens=False)
+            marker_tokens[start_marker] = start_ids
+            marker_tokens[end_marker] = end_ids
+        return marker_tokens
+
+    def _find_special_token_id_ranges(
+        self, token_ids: List[int], marker_tokens: Dict[str, List[int]]
+    ) -> List[Tuple[int, int]]:
+        """
+        Find token index ranges that correspond to special markers.
+        Returns list of (start_idx, end_idx) tuples to ignore.
+        """
+        ignore_ranges = []
+
+        for start_marker, end_marker in self.special_token_pairs:
+            start_pattern = marker_tokens[start_marker]
+            end_pattern = marker_tokens[end_marker]
+
+            # Find all occurrences of start pattern
+            i = 0
+            while i <= len(token_ids) - len(start_pattern):
+                # Check if start pattern matches at position i
+                if token_ids[i:i+len(start_pattern)] == start_pattern:
+                    start_idx = i
+
+                    # Look for matching end pattern
+                    j = start_idx + len(start_pattern)
+                    found_end = False
+
+                    while j <= len(token_ids) - len(end_pattern):
+                        if token_ids[j:j+len(end_pattern)] == end_pattern:
+                            end_idx = j + len(end_pattern)  # Include end marker
+                            ignore_ranges.append((start_idx, end_idx))
+                            found_end = True
+                            i = end_idx  # Skip past this range
+                            break
+                        j += 1
+
+                    if not found_end:
+                        # No matching end, ignore from start to end of sequence
+                        ignore_ranges.append((start_idx, len(token_ids)))
+                        break
+
+                    continue
+                i += 1
+
+        # Merge overlapping ranges
+        if ignore_ranges:
+            ignore_ranges.sort()
+            merged = [ignore_ranges[0]]
+            for start, end in ignore_ranges[1:]:
+                if start <= merged[-1][1]:
+                    merged[-1] = (merged[-1][0], max(merged[-1][1], end))
+                else:
+                    merged.append((start, end))
+            return merged
+
+        return []
+
+    def _create_token_mask(self, response_token_ids: List[int]) -> List[bool]:
+        """
+        Create a boolean mask for response tokens.
+        True = include in PPL/entropy computation, False = ignore.
+
+        Uses token-level matching instead of text matching to handle
+        cases where special markers are split across multiple tokens.
+        """
+        if not self.ignore_special_tokens:
+            return [True] * len(response_token_ids)
+
+        # Get token patterns for special markers
+        marker_tokens = self._tokenize_special_markers()
+
+        # Find token ranges to ignore
+        ignore_ranges = self._find_special_token_id_ranges(response_token_ids, marker_tokens)
+
+        if not ignore_ranges:
+            return [True] * len(response_token_ids)
+
+        # Create mask based on token indices
+        token_mask = [True] * len(response_token_ids)
+        for start_idx, end_idx in ignore_ranges:
+            for i in range(start_idx, min(end_idx, len(token_mask))):
+                token_mask[i] = False
+
+        return token_mask
+
+    def compute_ppl_and_entropy(self, sample: Dict) -> Tuple[float, float, List[float], List[float], List[bool]]:
         """
         Compute perplexity and entropy for a sample.
 
         Returns:
-            (sample_ppl, sample_entropy, token_ppls, token_entropies)
+            (sample_ppl, sample_entropy, token_ppls, token_entropies, token_inclusion_mask)
+            token_inclusion_mask: True for tokens to include in pruning consideration
         """
         # Extract prompt and response from conversations
         prompt = ""
@@ -180,7 +333,7 @@ class QTuningAnalyzer:
 
         if not prompt or not response:
             # Return high values to mark as Q1 (noise)
-            return 1000.0, 10.0, [], []
+            return 1000.0, 10.0, [], [], []
 
         # Tokenize
         full_text = prompt + response
@@ -190,6 +343,12 @@ class QTuningAnalyzer:
         # Move to device
         full_ids = full_ids.to(self.device)
         prompt_length = prompt_ids.shape[1]
+
+        # Get response token IDs
+        response_token_ids = full_ids[0, prompt_length:].tolist()
+
+        # Create mask for special tokens (token-level matching)
+        token_inclusion_mask = self._create_token_mask(response_token_ids)
 
         # Forward pass
         with torch.no_grad():
@@ -202,6 +361,8 @@ class QTuningAnalyzer:
         token_nlls = []
 
         for i in range(prompt_length, full_ids.shape[1]):
+            token_idx = i - prompt_length
+
             # Get token logits and compute log probs
             token_logits = logits[0, i-1, :]  # Predict token at position i
             log_probs = torch.nn.functional.log_softmax(token_logits, dim=-1)
@@ -210,7 +371,6 @@ class QTuningAnalyzer:
             # True token
             true_token_id = full_ids[0, i].item()
             token_nll = -log_probs[true_token_id].item()
-            token_nlls.append(token_nll)
 
             # Token perplexity
             token_ppl = np.exp(token_nll)
@@ -220,15 +380,24 @@ class QTuningAnalyzer:
             entropy = -(probs * log_probs).sum().item()
             token_entropies.append(entropy)
 
-        # Sample-level metrics (average over response tokens)
+            # Only include in sample-level metrics if not in special token range
+            if token_idx < len(token_inclusion_mask) and token_inclusion_mask[token_idx]:
+                token_nlls.append(token_nll)
+
+        # Sample-level metrics (average over non-special tokens only)
         if len(token_nlls) > 0:
             sample_ppl = np.exp(np.mean(token_nlls))
-            sample_entropy = np.mean(token_entropies)
+            # Filter entropies too
+            filtered_entropies = [
+                ent for i, ent in enumerate(token_entropies)
+                if i < len(token_inclusion_mask) and token_inclusion_mask[i]
+            ]
+            sample_entropy = np.mean(filtered_entropies) if filtered_entropies else np.mean(token_entropies)
         else:
             sample_ppl = 1000.0
             sample_entropy = 10.0
 
-        return sample_ppl, sample_entropy, token_ppls, token_entropies
+        return sample_ppl, sample_entropy, token_ppls, token_entropies, token_inclusion_mask
 
     def classify_quadrant(
         self, ppl: float, entropy: float,
@@ -300,10 +469,18 @@ class QTuningAnalyzer:
         ppls = np.array(ppls)
         entropies = np.array(entropies)
 
-        alpha_low, alpha_high = 0.0, 0.49
-        beta_low, beta_high = 0.0, 0.49
+        # Dynamic upper bound based on target keep ratio
+        # Maximum alpha/beta that still allows keeping target ratio
+        # When alpha=beta=0.5, all samples become "mid" range
+        max_quantile = min(0.495, (1.0 - self.sample_keep_ratio) / 2.0 + 0.02)
 
-        n_iterations = 10
+        alpha_low, alpha_high = 0.0, max_quantile
+        beta_low, beta_high = 0.0, max_quantile
+
+        n_iterations = 15  # Increased for better convergence
+        best_ratio = 0.0
+        best_thresholds = None
+
         for _ in range(n_iterations):
             alpha = (alpha_low + alpha_high) / 2
             beta = (beta_low + beta_high) / 2
@@ -323,14 +500,28 @@ class QTuningAnalyzer:
 
             ratio = q2_q4_count / len(ppls)
 
+            # Track best result
+            if abs(ratio - self.sample_keep_ratio) < abs(best_ratio - self.sample_keep_ratio):
+                best_ratio = ratio
+                best_thresholds = (ppl_low, ppl_high, ent_low, ent_high)
+
+            # Binary search adjustment
             if ratio < self.sample_keep_ratio:
-                # Too few kept, relax thresholds
-                alpha_low = alpha
-                beta_low = beta
-            else:
-                # Too many kept, tighten thresholds
+                # Too few kept, relax thresholds (decrease alpha/beta)
                 alpha_high = alpha
                 beta_high = beta
+            else:
+                # Too many kept, tighten thresholds (increase alpha/beta)
+                alpha_low = alpha
+                beta_low = beta
+
+            # Early stopping if close enough
+            if abs(ratio - self.sample_keep_ratio) < 0.02:  # Within 2%
+                break
+
+        # Use best found thresholds if final iteration isn't optimal
+        if best_thresholds and abs(best_ratio - self.sample_keep_ratio) < abs(ratio - self.sample_keep_ratio):
+            return best_thresholds
 
         return ppl_low, ppl_high, ent_low, ent_high
 
@@ -363,6 +554,7 @@ class QTuningAnalyzer:
             {
                 "kept": [...],  # Q2 + Q4 samples
                 "removed": {...},  # Q1 and Q3 samples by quadrant
+                "quadrants": {...},  # All quadrants for comparison
                 "statistics": {...}
             }
         """
@@ -379,7 +571,7 @@ class QTuningAnalyzer:
         enriched_samples = []
 
         for sample in tqdm(all_samples, desc="Computing metrics"):
-            ppl, entropy, token_ppls, token_entropies = self.compute_ppl_and_entropy(sample)
+            ppl, entropy, token_ppls, token_entropies, token_mask = self.compute_ppl_and_entropy(sample)
 
             # Add metrics to sample metadata
             if "metadata" not in sample or sample["metadata"] is None:
@@ -388,6 +580,7 @@ class QTuningAnalyzer:
             sample["metadata"]["entropy"] = float(entropy)
             sample["metadata"]["token_ppls"] = [float(p) for p in token_ppls]
             sample["metadata"]["token_entropies"] = [float(e) for e in token_entropies]
+            sample["metadata"]["special_token_mask"] = token_mask  # Save for stage2
 
             ppls.append(ppl)
             entropies.append(entropy)
@@ -438,6 +631,7 @@ class QTuningAnalyzer:
         return {
             "kept": quadrants["Q2"] + quadrants["Q4"],
             "removed": {"Q1": quadrants["Q1"], "Q3": quadrants["Q3"]},
+            "quadrants": quadrants,
             "statistics": stats,
         }
 
@@ -480,6 +674,7 @@ class QTuningAnalyzer:
             elif quadrant == "Q2":
                 # Apply token pruning
                 token_ppls = sample["metadata"]["token_ppls"]
+                special_token_mask = sample["metadata"].get("special_token_mask", None)
 
                 if len(token_ppls) == 0:
                     final_samples.append(sample)
@@ -490,6 +685,7 @@ class QTuningAnalyzer:
                 # Compute neighbor-aware scores
                 scores = self.neighbor_aware_token_scoring(token_ppls)
 
+<<<<<<< HEAD
                 # Determine threshold (keep top token_keep_ratio tokens)
                 n_keep = max(1, int(len(scores) * self.token_keep_ratio))
 <<<<<<< HEAD
@@ -503,6 +699,45 @@ class QTuningAnalyzer:
                 # Create token mask
                 token_mask = [1 if s >= score_threshold else 0 for s in scores]
 >>>>>>> f75c7c5 (Slime length penalty (#1))
+=======
+                # If special token handling is enabled, force keep special tokens
+                if self.ignore_special_tokens and special_token_mask:
+                    # Count how many prunable tokens we have (excluding special tokens)
+                    prunable_indices = [i for i in range(len(scores))
+                                       if i >= len(special_token_mask) or special_token_mask[i]]
+
+                    if prunable_indices:
+                        # Determine how many prunable tokens to keep
+                        n_keep_prunable = max(1, int(len(prunable_indices) * self.token_keep_ratio))
+
+                        # Get scores only for prunable tokens
+                        prunable_scores = [(i, scores[i]) for i in prunable_indices]
+                        prunable_scores.sort(key=lambda x: x[1])  # Sort by score
+
+                        # Select indices to keep (lowest scores)
+                        keep_indices = set(idx for idx, _ in prunable_scores[:n_keep_prunable])
+
+                        # Create token mask: keep special tokens + selected prunable tokens
+                        token_mask = []
+                        for i in range(len(scores)):
+                            if i < len(special_token_mask) and not special_token_mask[i]:
+                                # This is a special token, always keep
+                                token_mask.append(1)
+                            elif i in keep_indices or i >= len(special_token_mask):
+                                # Selected for keeping or beyond mask range
+                                token_mask.append(1 if i in keep_indices else 0)
+                            else:
+                                token_mask.append(0)
+                    else:
+                        # All tokens are special tokens, keep all
+                        token_mask = [1] * len(scores)
+                else:
+                    # No special token handling, use normal pruning
+                    n_keep = max(1, int(len(scores) * self.token_keep_ratio))
+                    score_threshold = sorted(scores)[n_keep - 1]
+                    token_mask = [1 if s <= score_threshold else 0 for s in scores]
+
+>>>>>>> d6bfd86 (qtuning test bug fix Q2Q4 sample & Long CoT token pruning)
                 sample["metadata"]["token_mask"] = token_mask
                 sample["metadata"]["tokens_kept"] = sum(token_mask)
                 sample["metadata"]["tokens_removed"] = len(token_mask) - sum(token_mask)
@@ -571,48 +806,123 @@ class QTuningAnalyzer:
 
         return visualization
 
-    def generate_html_visualization(self, stage2_result: Dict) -> str:
-        """Generate an HTML file to visualize token pruning."""
+    def generate_html_visualization(
+        self, stage1_result: Dict, stage2_result: Dict
+    ) -> str:
+        """Generate comprehensive HTML visualization comparing both stages."""
+        quadrants = stage1_result["quadrants"]
+        stats1 = stage1_result["statistics"]
+        stats2 = stage2_result["statistics"]
+
         html = """
 <!DOCTYPE html>
 <html>
 <head>
     <meta charset="UTF-8">
-    <title>Q-Tuning Token Pruning Visualization</title>
+    <title>Q-Tuning Pruning Analysis</title>
     <style>
         body {
             font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
             margin: 20px;
             background-color: #f5f5f5;
+            max-width: 1400px;
+            margin: 0 auto;
+            padding: 20px;
         }
         .header {
-            background-color: #2c3e50;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
             color: white;
-            padding: 20px;
-            border-radius: 5px;
-            margin-bottom: 20px;
+            padding: 30px;
+            border-radius: 10px;
+            margin-bottom: 30px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
         }
-        .sample {
+        .section {
             background-color: white;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            padding: 15px;
-            margin-bottom: 20px;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+            border-radius: 10px;
+            padding: 25px;
+            margin-bottom: 30px;
+            box-shadow: 0 2px 8px rgba(0,0,0,0.1);
         }
-        .sample-header {
+        .section-title {
+            font-size: 24px;
             font-weight: bold;
-            margin-bottom: 10px;
+            margin-bottom: 20px;
             color: #2c3e50;
-            border-bottom: 2px solid #3498db;
-            padding-bottom: 5px;
+            border-left: 5px solid #667eea;
+            padding-left: 15px;
+        }
+        .comparison-grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 20px;
+            margin-bottom: 30px;
+        }
+        .quadrant-box {
+            border: 2px solid #ddd;
+            border-radius: 8px;
+            padding: 20px;
+            background-color: #f8f9fa;
+        }
+        .q1-box { border-color: #e74c3c; background-color: #fdecea; }
+        .q2-box { border-color: #f39c12; background-color: #fef5e7; }
+        .q3-box { border-color: #95a5a6; background-color: #ecf0f1; }
+        .q4-box { border-color: #3498db; background-color: #ebf5fb; }
+        .quadrant-header {
+            font-weight: bold;
+            font-size: 18px;
+            margin-bottom: 10px;
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+        }
+        .quadrant-count {
+            background-color: rgba(0,0,0,0.1);
+            padding: 5px 12px;
+            border-radius: 15px;
+            font-size: 14px;
+        }
+        .quadrant-desc {
+            font-style: italic;
+            color: #666;
+            margin-bottom: 15px;
+        }
+        .sample-preview {
+            background-color: white;
+            border-radius: 5px;
+            padding: 10px;
+            margin-top: 10px;
+            font-size: 13px;
+            max-height: 150px;
+            overflow-y: auto;
+        }
+        .sample-content {
+            color: #444;
+            line-height: 1.6;
+        }
+        .metrics {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 10px;
+            margin-top: 10px;
+            font-size: 13px;
+        }
+        .metric {
+            background-color: rgba(255,255,255,0.5);
+            padding: 8px;
+            border-radius: 5px;
+        }
+        .metric-label {
+            font-weight: bold;
+            color: #555;
         }
         .token {
             display: inline-block;
-            padding: 2px 5px;
+            padding: 3px 6px;
             margin: 2px;
             border-radius: 3px;
-            font-family: monospace;
+            font-family: 'Consolas', monospace;
+            font-size: 13px;
         }
         .token-kept {
             background-color: #2ecc71;
@@ -622,67 +932,206 @@ class QTuningAnalyzer:
             background-color: #e74c3c;
             color: white;
             text-decoration: line-through;
+            opacity: 0.7;
         }
-        .legend {
+        .stage2-sample {
             background-color: white;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-            padding: 15px;
+            border: 2px solid #f39c12;
+            border-radius: 8px;
+            padding: 20px;
             margin-bottom: 20px;
         }
-        .legend-item {
-            display: inline-block;
-            margin-right: 20px;
+        .stage2-header {
+            font-weight: bold;
+            margin-bottom: 15px;
+            color: #2c3e50;
+            font-size: 16px;
         }
-        .stats {
+        .token-stats {
+            background-color: #fef5e7;
+            padding: 12px;
+            border-radius: 5px;
+            margin-top: 15px;
+            font-size: 14px;
+        }
+        .legend {
             background-color: #ecf0f1;
-            padding: 10px;
-            border-radius: 3px;
-            margin-top: 10px;
-            font-size: 0.9em;
+            padding: 15px;
+            border-radius: 8px;
+            margin-bottom: 20px;
+            display: flex;
+            gap: 20px;
+            align-items: center;
+        }
+        .legend-title {
+            font-weight: bold;
+            margin-right: 10px;
+        }
+        .stats-summary {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 8px;
+            margin-bottom: 30px;
+        }
+        .stats-grid {
+            display: grid;
+            grid-template-columns: repeat(4, 1fr);
+            gap: 15px;
+            margin-top: 15px;
+        }
+        .stat-item {
+            text-align: center;
+        }
+        .stat-value {
+            font-size: 32px;
+            font-weight: bold;
+            margin-bottom: 5px;
+        }
+        .stat-label {
+            font-size: 14px;
+            opacity: 0.9;
         }
     </style>
 </head>
 <body>
     <div class="header">
-        <h1>Q-Tuning Token Pruning Visualization</h1>
-        <p>This page shows token-level pruning results for Q2 (Valuable Misconception) samples.</p>
+        <h1>Q-Tuning Pruning Analysis</h1>
+        <p>Comprehensive visualization of two-stage data pruning: Sample-level (Stage 1) and Token-level (Stage 2)</p>
     </div>
 
-    <div class="legend">
-        <div class="legend-item">
-            <span class="token token-kept">Kept Token</span>
-        </div>
-        <div class="legend-item">
-            <span class="token token-removed">Removed Token</span>
+    <div class="stats-summary">
+        <h2 style="margin-top: 0;">Overall Statistics</h2>
+        <div class="stats-grid">
+            <div class="stat-item">
+                <div class="stat-value">{stats1['total_samples']}</div>
+                <div class="stat-label">Total Samples</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value">{stats1['kept_count']}</div>
+                <div class="stat-label">Kept After Stage 1</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value">{stats1['actual_keep_ratio']:.1%}</div>
+                <div class="stat-label">Sample Keep Ratio</div>
+            </div>
+            <div class="stat-item">
+                <div class="stat-value">{stats2['token_compression_ratio']:.1%}</div>
+                <div class="stat-label">Token Compression</div>
+            </div>
         </div>
     </div>
+
+    <div class="section">
+        <div class="section-title">Stage 1: Sample-Level Pruning (EU Plane Quadrants)</div>
+        <p style="color: #666; margin-bottom: 20px;">
+            Samples are classified based on Perplexity (error) and Entropy (uncertainty).
+            <strong>Q2 and Q4 are kept</strong>, while <strong>Q1 and Q3 are removed</strong>.
+        </p>
+
+        <div class="comparison-grid">
 """
 
-        for i, vis in enumerate(stage2_result["pruned_visualizations"][:50]):  # Show first 50
-            html += f"""
-    <div class="sample">
-        <div class="sample-header">Sample {i+1} (ID: {vis['sample_id']}, Quadrant: {vis['quadrant']})</div>
-        <div>
-"""
-            for token_info in vis["tokens"]:
-                token_class = "token-kept" if token_info["kept"] else "token-removed"
-                token_text = token_info["text"].replace(" ", "·")  # Make spaces visible
-                ppl = token_info["ppl"]
-                html += f'<span class="token {token_class}" title="PPL: {ppl:.2f}">{token_text}</span>'
+        # Generate quadrant boxes with sample previews
+        quadrant_info = {
+            "Q1": ("Harmful Noise", "High PPL + High Entropy", "REMOVED", "q1-box"),
+            "Q2": ("Valuable Misconception", "High PPL + Low Entropy", "KEPT → Token Pruning", "q2-box"),
+            "Q3": ("Redundant Knowledge", "Low PPL + Low Entropy", "REMOVED", "q3-box"),
+            "Q4": ("Calibration Data", "Low PPL + High Entropy", "KEPT (Full)", "q4-box"),
+        }
 
-            kept_count = sum(1 for t in vis["tokens"] if t["kept"])
-            removed_count = sum(1 for t in vis["tokens"] if not t["kept"])
+        for quad_name in ["Q1", "Q2", "Q3", "Q4"]:
+            title, desc, action, css_class = quadrant_info[quad_name]
+            samples = quadrants[quad_name]
+            count = len(samples)
+
             html += f"""
-        </div>
-        <div class="stats">
-            Tokens: {kept_count} kept / {removed_count} removed / {len(vis["tokens"])} total
-            (compression: {kept_count/len(vis["tokens"])*100:.1f}%)
-        </div>
-    </div>
+            <div class="quadrant-box {css_class}">
+                <div class="quadrant-header">
+                    <span>{quad_name}: {title}</span>
+                    <span class="quadrant-count">{count} samples</span>
+                </div>
+                <div class="quadrant-desc">{desc} → {action}</div>
+"""
+
+            # Show first sample as preview
+            if samples:
+                sample = samples[0]
+                ppl = sample["metadata"].get("ppl", 0)
+                entropy = sample["metadata"].get("entropy", 0)
+
+                # Extract text preview
+                text_preview = ""
+                if "conversations" in sample and sample["conversations"]:
+                    for msg in sample["conversations"][:2]:
+                        role = "User" if msg.get("from") == "human" else "Assistant"
+                        content = msg.get("value", "")[:200]
+                        text_preview += f"<strong>{role}:</strong> {content}...<br>"
+
+                html += f"""
+                <div class="sample-preview">
+                    <div class="sample-content">{text_preview}</div>
+                    <div class="metrics">
+                        <div class="metric">
+                            <span class="metric-label">PPL:</span> {ppl:.2f}
+                        </div>
+                        <div class="metric">
+                            <span class="metric-label">Entropy:</span> {entropy:.2f}
+                        </div>
+                    </div>
+                </div>
+"""
+
+            html += """
+            </div>
 """
 
         html += """
+        </div>
+    </div>
+
+    <div class="section">
+        <div class="section-title">Stage 2: Token-Level Pruning (Q2 Samples Only)</div>
+        <p style="color: #666; margin-bottom: 20px;">
+            For Q2 samples (Valuable Misconceptions), we apply neighbor-aware token pruning to remove high-perplexity tokens while keeping low-perplexity ones.
+        </p>
+
+        <div class="legend">
+            <span class="legend-title">Legend:</span>
+            <span class="token token-kept">Kept Token</span>
+            <span class="token token-removed">Removed Token</span>
+        </div>
+"""
+
+        # Show token pruning examples
+        for i, vis in enumerate(stage2_result["pruned_visualizations"][:20]):
+            html += f"""
+        <div class="stage2-sample">
+            <div class="stage2-header">Sample {i+1} (ID: {vis['sample_id']})</div>
+            <div>
+"""
+            for token_info in vis["tokens"]:
+                token_class = "token-kept" if token_info["kept"] else "token-removed"
+                token_text = token_info["text"].replace(" ", "·").replace("<", "&lt;").replace(">", "&gt;")
+                ppl = token_info["ppl"]
+                html += f'<span class="token {token_class}" title="PPL: {ppl:.2f}">{token_text}</span>'
+
+            kept = sum(1 for t in vis["tokens"] if t["kept"])
+            removed = sum(1 for t in vis["tokens"] if not t["kept"])
+            total = len(vis["tokens"])
+            compression = kept / total * 100 if total > 0 else 0
+
+            html += f"""
+            </div>
+            <div class="token-stats">
+                <strong>Tokens:</strong> {kept} kept / {removed} removed / {total} total
+                <strong style="margin-left: 20px;">Compression:</strong> {compression:.1f}%
+            </div>
+        </div>
+"""
+
+        html += """
+    </div>
 </body>
 </html>
 """
@@ -725,7 +1174,7 @@ class QTuningAnalyzer:
 
         # HTML visualization
         html_path = self.output_dir / "token_pruning_visualization.html"
-        html_content = self.generate_html_visualization(stage2_result)
+        html_content = self.generate_html_visualization(stage1_result, stage2_result)
         with open(html_path, 'w', encoding='utf-8') as f:
             f.write(html_content)
         print(f"Saved HTML visualization to {html_path}")
@@ -790,8 +1239,37 @@ def main():
                        help="Token keep ratio for Q2 samples (default: 0.7)")
     parser.add_argument("--neighbor-lambda", type=float, default=0.5,
                        help="Neighbor weight in token scoring (default: 0.5)")
+    parser.add_argument("--ignore-special-tokens", action="store_true",
+                       help="Ignore tokens within special token pairs (e.g., <think>...</think>) when computing PPL/Entropy")
+    parser.add_argument("--special-token-pairs", type=str, nargs="+",
+                       default=["<think>,</think>", "<answer>,</answer>"],
+                       help="Special token pairs to ignore, format: 'start,end' (default: '<think>,</think>' '<answer>,</answer>')")
 
     args = parser.parse_args()
+
+    # Parse special token pairs
+    special_pairs = []
+    for pair in args.special_token_pairs:
+        parts = pair.split(",")
+        if len(parts) == 2:
+            special_pairs.append((parts[0], parts[1]))
+        else:
+            print(f"Warning: Invalid special token pair format: {pair}, skipping...")
+
+    print(f"\n{'='*80}")
+    print("Q-TUNING PRUNING ANALYSIS")
+    print(f"{'='*80}")
+    print(f"Model: {args.model_path}")
+    print(f"Data: {args.data_path}")
+    print(f"Output: {args.output_dir}")
+    print(f"Sample keep ratio: {args.sample_keep_ratio}")
+    print(f"Token keep ratio: {args.token_keep_ratio}")
+    if args.ignore_special_tokens:
+        print(f"Special token handling: ENABLED")
+        print(f"  Ignoring tokens within: {special_pairs}")
+    else:
+        print(f"Special token handling: DISABLED")
+    print(f"{'='*80}\n")
 
     # Create analyzer
     analyzer = QTuningAnalyzer(
@@ -801,6 +1279,8 @@ def main():
         sample_keep_ratio=args.sample_keep_ratio,
         token_keep_ratio=args.token_keep_ratio,
         neighbor_lambda=args.neighbor_lambda,
+        ignore_special_tokens=args.ignore_special_tokens,
+        special_token_pairs=special_pairs if special_pairs else None,
     )
 
     # Run analysis

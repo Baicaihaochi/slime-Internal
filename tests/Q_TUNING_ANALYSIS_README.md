@@ -1,216 +1,255 @@
-# Q-Tuning Data Pruning Analysis
+# Q-Tuning Pruning Analysis
 
-This script implements the Q-Tuning pruning method from the paper:
-**"Winning the Pruning Gamble: A Unified Approach to Joint Sample and Token Pruning for Efficient Supervised Fine-Tuning"**
+This document explains the Q-Tuning two-stage pruning strategy and how to analyze the pruned data.
 
-## What It Does
+## Overview
 
-The script analyzes your training data through two stages:
+Q-Tuning implements a two-stage data pruning approach based on the paper "Winning the Pruning Gamble" (arXiv:2509.23873):
 
-### Stage 1: Sample-Level Pruning
-Classifies samples into 4 quadrants based on **Perplexity (PPL)** and **Entropy**:
+1. **Stage 1: Sample-Level Pruning** - Removes entire samples based on Error-Uncertainty (EU) Plane
+2. **Stage 2: Token-Level Pruning** - Selectively removes high-perplexity tokens from valuable misconceptions
 
-| Quadrant | Characteristics | Action |
-|----------|----------------|--------|
-| **Q1: Harmful Noise** | High PPL + High Entropy | ❌ **REMOVE** - Unreliable/mislabeled |
-| **Q2: Valuable Misconception** | High PPL + Low Entropy | ✅ **KEEP** + Token Pruning |
-| **Q3: Redundant Knowledge** | Low PPL + Low Entropy | ❌ **REMOVE** - Already mastered |
-| **Q4: Calibration Data** | Low PPL + High Entropy | ✅ **KEEP FULL** - Hard but reliable |
+## Key Differences Between Stages
 
-### Stage 2: Token-Level Pruning
-For **Q2 samples only**, removes high-perplexity tokens using a **neighbor-aware scoring** mechanism:
+### Stage 1: Sample-Level Pruning (EU Plane)
 
+**What it does:** Classifies entire samples into 4 quadrants based on **Perplexity (PPL)** and **Entropy**:
+
+| Quadrant | PPL | Entropy | Interpretation | Action |
+|----------|-----|---------|----------------|--------|
+| **Q1** | High | High | Harmful Noise - Model uncertain AND wrong | ❌ **REMOVED** |
+| **Q2** | High | Low | Valuable Misconception - Model confident but wrong | ✅ **KEPT** → Token Pruning |
+| **Q3** | Low | Low | Redundant Knowledge - Model already mastered | ❌ **REMOVED** |
+| **Q4** | Low | High | Calibration Data - Model correct but uncertain | ✅ **KEPT** (full) |
+
+**Implementation Details:**
+- Uses bisection search to find PPL/Entropy thresholds that keep ~50% of samples (configurable)
+- Removes **Q1** (noisy, harmful) and **Q3** (redundant, already learned)
+- Keeps **Q2** (needs refinement via token pruning) and **Q4** (valuable calibration)
+
+**Key Code:**
+```python
+# From q_tuning_pruner.py
+def bisect_search_thresholds(self, ppls, entropies):
+    # Find thresholds to keep sample_keep_ratio in Q2+Q4
+    ppl_low, ppl_high = np.quantile(ppls, [alpha, 1-alpha])
+    ent_low, ent_high = np.quantile(entropies, [beta, 1-beta])
 ```
-token_score = (1-λ) × PPL_i + λ × (PPL_{i-1} + PPL_{i+1}) / 2
-```
 
-**Q4 samples** are kept completely intact to preserve calibration signals.
+### Stage 2: Token-Level Pruning (Q2 Only)
+
+**What it does:** For **Q2 samples only**, removes high-perplexity tokens while keeping low-perplexity ones.
+
+**Why Q2?** These samples have:
+- **High PPL** (model makes errors) → Need refinement
+- **Low Entropy** (model is confident) → Errors are systematic, not random
+
+**Algorithm:**
+1. Compute **neighbor-aware token scores** using surrounding context:
+   ```
+   score_i = (1-λ) × PPL_i + λ × (PPL_{i-1} + PPL_{i+1}) / 2
+   ```
+2. Keep tokens with **lowest scores** (lowest perplexity = easiest to predict)
+3. Remove tokens with **highest scores** (highest perplexity = hardest to predict)
+
+**Key Insight:** By removing high-PPL tokens, we focus training on the parts where the model is more confident, avoiding reinforcing systematic errors.
+
+**Implementation Details:**
+- Default `token_keep_ratio = 0.7` (keeps 70% of tokens)
+- Uses neighbor smoothing (`neighbor_lambda = 0.5`) to avoid removing context
+- **Q4 samples are kept in full** (no token pruning) as they provide valuable calibration
+
+**Key Code:**
+```python
+# From q_tuning_pruner.py
+def prune_tokens(self, tokens, token_ppls, response_start_idx):
+    scores = self.neighbor_aware_token_scoring(token_ppls)
+    num_keep = int(len(scores) * self.token_keep_ratio)
+    sorted_indices = np.argsort(scores)[:num_keep]  # Keep lowest scores
+```
 
 ## Usage
 
-### Quick Start
+### Running the Analysis
 
 ```bash
-cd /Users/shuocai/Downloads/slime/tests
-python test_q_tuning_pruning.py
+python tests/test_q_tuning_pruning.py \
+    --model-path /path/to/model \
+    --data-path /path/to/data.json \
+    --output-dir ./q_tuning_output \
+    --n-math 100 \
+    --n-code 100 \
+    --sample-keep-ratio 0.5 \
+    --token-keep-ratio 0.7
 ```
 
-### Configuration
+**Key Parameters:**
+- `--n-math`: Number of math samples (set to `-1` for all)
+- `--n-code`: Number of code samples (set to `-1` for all)
+- `--sample-keep-ratio`: Target ratio for Q2+Q4 samples (default: 0.5)
+- `--token-keep-ratio`: Ratio of tokens to keep in Q2 samples (default: 0.7)
+- `--neighbor-lambda`: Neighbor smoothing weight (default: 0.5)
+- `--ignore-special-tokens`: Ignore special tokens when computing PPL/Entropy (for Long CoT data)
+- `--special-token-pairs`: Custom special token pairs (default: `<think>,</think>` and `<answer>,</answer>`)
 
-Edit these parameters in the script's `main()` function:
+### Output Files
 
-```python
-analyzer = QTuningAnalyzer(
-    model_path="/Users/shuocai/Documents/code/iter_0010999__e8m0",  # Your model
-    data_path="/Users/shuocai/Documents/code/cs_data/0726--57kmath_57kcode_34kscience_deduped--0.8-easy-math-code-final.json",
-    output_dir="/Users/shuocai/Downloads/slime/tests/q_tuning_analysis_output",
-
-    sample_keep_ratio=0.5,   # Keep 50% of samples (Q2 + Q4)
-    token_keep_ratio=0.7,    # Keep 70% of tokens in Q2 samples
-    neighbor_lambda=0.5,     # Neighbor weight in token scoring
-)
-```
-
-### Requirements
-
-```bash
-pip install torch transformers tqdm numpy
-```
-
-## Output Files
-
-After running, you'll find these files in `q_tuning_analysis_output/`:
-
-### 📊 Main Results
-
-1. **`stage1_kept.json`** - Samples retained after Stage 1 (Q2 + Q4)
-   - Contains PPL, Entropy, and quadrant classification in `metadata`
-
+1. **`stage1_kept.json`** - Samples kept after Stage 1 (Q2 + Q4)
 2. **`stage1_removed.json`** - Samples removed in Stage 1 (Q1 + Q3)
-   - Organized by quadrant: `{"Q1": [...], "Q3": [...]}`
-
-3. **`stage2_final.json`** - Final samples after token pruning
-   - Q2 samples have `token_mask` in metadata
-   - Q4 samples marked as `"tokens_kept": "all"`
-
+3. **`stage2_final.json`** - Final training data after both stages
 4. **`stage2_pruned_tokens_visualization.json`** - Token-level pruning details
-   - Shows which tokens were kept/removed for each Q2 sample
+5. **`token_pruning_visualization.html`** - Interactive HTML visualization
+6. **`summary_statistics.json`** - Statistical summary
 
-5. **`token_pruning_visualization.html`** 🎨 **INTERACTIVE VISUALIZATION**
-   - **Open this in your browser!**
-   - Visual comparison of kept (green) vs removed (red) tokens
-   - Hover over tokens to see their PPL scores
-   - Shows first 50 Q2 samples
+### Visualization
 
-6. **`summary_statistics.json`** - Overall statistics
-   ```json
-   {
-     "stage1": {
-       "Q1_count": 25,
-       "Q2_count": 60,
-       "Q3_count": 15,
-       "Q4_count": 40,
-       "actual_keep_ratio": 0.50
-     },
-     "stage2": {
-       "total_tokens_before": 15000,
-       "total_tokens_after": 10500,
-       "token_compression_ratio": 0.70
-     }
-   }
-   ```
+Open `token_pruning_visualization.html` to see:
+- **Stage 1**: Sample distribution across Q1-Q4 quadrants with example previews
+- **Stage 2**: Token-by-token visualization showing kept (green) vs removed (red) tokens
+- **Statistics**: Overall compression ratios and sample counts
 
-## Sample Metadata Structure
+## Comparison: Stage 1 vs Stage 2
 
-Each processed sample will have this metadata:
+| Aspect | Stage 1 (Sample-Level) | Stage 2 (Token-Level) |
+|--------|------------------------|----------------------|
+| **Granularity** | Entire samples | Individual tokens |
+| **Metric** | Sample PPL + Entropy | Token PPL + neighbor context |
+| **Decision** | Keep/Remove whole sample | Keep/Remove specific tokens |
+| **Applied to** | All samples | Q2 samples only |
+| **Output** | Q2 + Q4 samples | Q2 (pruned) + Q4 (full) |
+| **Goal** | Remove noise (Q1) and redundancy (Q3) | Refine misconceptions (Q2) |
 
-```json
-{
-  "id": 0,
-  "problem": "...",
-  "category": "math",
-  "conversations": [...],
-  "metadata": {
-    "ppl": 8.65,                          // Sample-level perplexity
-    "entropy": 1.54,                      // Sample-level entropy
-    "token_ppls": [2.1, 15.3, 8.7, ...], // Per-token perplexity
-    "token_entropies": [0.8, 1.2, ...],  // Per-token entropy
-    "quadrant": "Q2",                     // Q1/Q2/Q3/Q4
-    "token_mask": [1, 0, 1, 1, ...],     // 1=kept, 0=removed (Q2 only)
-    "tokens_kept": 250,                   // Number of kept tokens
-    "tokens_removed": 100                 // Number of removed tokens
-  }
-}
+## Example Workflow
+
+```
+Input: 200 samples (100 math + 100 code)
+  ↓
+Stage 1: Sample-Level Pruning
+  • Q1 (Harmful Noise): 40 samples → REMOVED
+  • Q2 (Valuable Misconception): 50 samples → KEPT (for token pruning)
+  • Q3 (Redundant Knowledge): 60 samples → REMOVED
+  • Q4 (Calibration Data): 50 samples → KEPT (full)
+  ↓ 100 samples kept (50%)
+
+Stage 2: Token-Level Pruning (Q2 only)
+  • Q2: 50 samples × ~200 tokens/sample = 10,000 tokens
+    → Keep 70% = 7,000 tokens (remove 3,000 high-PPL tokens)
+  • Q4: 50 samples × ~200 tokens/sample = 10,000 tokens
+    → Keep 100% = 10,000 tokens (no pruning)
+  ↓
+Final Output: 100 samples with 17,000 tokens total (85% compression)
 ```
 
-## Expected Runtime
+## Key Insights
 
-- **Model loading**: ~30 seconds
-- **Computing PPL/Entropy**: ~2-5 seconds per sample
-- **Total for 200 samples**: ~15-20 minutes (depending on GPU)
+1. **Stage 1 removes samples entirely** - No recovery possible
+   - Q1 samples are too noisy to be useful
+   - Q3 samples are already learned (redundant)
 
-## Analyzing Results
+2. **Stage 2 refines Q2 samples** - Keeps valuable structure while removing problematic tokens
+   - Focuses on systematic misconceptions (confident errors)
+   - Uses neighbor context to avoid breaking coherence
 
-### 1. Check Statistics
+3. **Q4 samples are precious** - Never pruned at token level
+   - Provide calibration for model uncertainty
+   - Help model learn when to be uncertain
+
+## Long CoT (Chain-of-Thought) Data Support
+
+For Long CoT datasets where reasoning is wrapped in special tokens (e.g., `<think>...</think>` and `<answer>...</answer>`), these tokens often have **high perplexity** which can bias the pruning decisions.
+
+### Problem
+
+```
+User: What is 2+2?
+Assistant: <think>This is addition. 2+2=4.</think><answer>4</answer>
+```
+
+- `<think>` and `</think>` tokens have **high PPL** (model not trained on these markers)
+- This can incorrectly classify good samples as Q1 (Harmful Noise)
+- Token pruning might remove valuable reasoning steps
+
+### Solution
+
+Use `--ignore-special-tokens` to exclude these tokens from PPL/Entropy computation:
+
 ```bash
-cat q_tuning_analysis_output/summary_statistics.json
+python tests/test_q_tuning_pruning.py \
+    --model-path /path/to/model \
+    --data-path /path/to/long_cot_data.json \
+    --ignore-special-tokens \
+    --special-token-pairs "<think>,</think>" "<answer>,</answer>"
 ```
 
-**What to look for:**
-- Q2 (Misconception) should be **20-40%** of samples
-- Q4 (Calibration) should be **20-40%** of samples
-- Token compression in Q2 should match your `token_keep_ratio`
+### How It Works
 
-### 2. View Visualizations
+The implementation uses **token-level matching** instead of text matching to handle tokenization properly:
+
+1. **Pre-tokenizes special markers**: `<think>` → `[60, 27963, 62]` (e.g., `['<', 'think', '>']`)
+2. **Pattern matching on token IDs**: Searches for exact token ID sequences in the response
+3. **Identifies token ranges**: Marks all tokens between start and end patterns
+4. **Stage 1 - Excludes from metrics**: Ignores marked tokens when computing sample-level PPL/Entropy
+5. **Stage 2 - Force preservation**: Special tokens are **never pruned** during token-level pruning
+
+**Key advantage**: Correctly handles cases where special markers are split across multiple tokens:
+- `<think>` might tokenize as `['<', 'th', 'ink', '>']` (4 tokens)
+- `</think>` might tokenize as `['</', 'th', 'ink', '>']` (4 tokens)
+- All 8 tokens will be correctly identified and preserved
+
+### Custom Special Tokens
+
+You can specify any special token pairs:
+
 ```bash
-open q_tuning_analysis_output/token_pruning_visualization.html
+--ignore-special-tokens \
+--special-token-pairs \
+    "<reasoning>,</reasoning>" \
+    "<reflection>,</reflection>" \
+    "<answer>,</answer>"
 ```
 
-**What to look for:**
-- Are removed tokens (red) actually noisy or redundant?
-- Are kept tokens (green) the core reasoning steps?
+### Example Output
 
-### 3. Sample Q2 Examples
+When running with `--ignore-special-tokens`, you'll see how special tokens are tokenized:
+
 ```bash
-jq '.[] | select(.metadata.quadrant == "Q2") | {id, ppl, entropy, tokens_removed}' q_tuning_analysis_output/stage2_final.json | head -20
+Special token tokenization preview:
+  <think>              → [60, 27963, 62] = ['<', 'think', '>']
+  </think>             → [1340, 27963, 62] = ['</', 'think', '>']
+  <answer>             → [60, 12011, 62] = ['<', 'answer', '>']
+  </answer>            → [1340, 12011, 62] = ['</', 'answer', '>']
 ```
 
-### 4. Sample Q4 Examples (for comparison)
-```bash
-jq '.[] | select(.metadata.quadrant == "Q4") | {id, ppl, entropy}' q_tuning_analysis_output/stage1_kept.json | head -20
+**Without `--ignore-special-tokens`:**
+```
+Sample PPL: 45.2 (HIGH due to <think> tokens having high perplexity)
+Quadrant: Q1 (Harmful Noise) → REMOVED ❌
 ```
 
-## Troubleshooting
+**With `--ignore-special-tokens`:**
+```
+Sample PPL: 3.8 (computed only on actual reasoning, excluding special markers)
+Quadrant: Q2 (Valuable Misconception) → KEPT ✅
 
-### Error: "Cannot load model"
-- Check that model path exists: `ls /Users/shuocai/Documents/code/iter_0010999__e8m0`
-- Ensure model is in HuggingFace format (not Megatron torch_dist)
+Stage 2 Token Pruning for Q2 samples:
+  Total tokens: 100
+  Special tokens: 8 (<think>, </think>, <answer>, </answer>)
+  Prunable tokens: 92
+  Target keep ratio: 70%
+  → Keep: 64 content tokens (70% of 92) + 8 special tokens = 72 tokens total
+  → Remove: 28 content tokens only (special tokens preserved)
+```
 
-### Error: "Out of memory"
-- Reduce batch size in model inference
-- Process fewer samples: Change `n_math=50, n_code=50` in `load_samples()`
+### When to Use
 
-### Warning: "Not enough math/code samples"
-- Your dataset might not have clear category labels
-- Check the `category` field in your data
+- ✅ Your data has special structural tokens (`<think>`, `<answer>`, etc.)
+- ✅ These tokens weren't in the model's training data
+- ✅ You want to focus on the content, not the markup
+- ❌ Your data uses standard formats without special tokens
+- ❌ Special tokens are part of your model's vocabulary
 
-### All samples classified as Q1 or Q3
-- Your model might be too good or too bad on this data
-- Try adjusting `sample_keep_ratio` to 0.3 or 0.7
+## References
 
-## Integration with slime Training
-
-Once you've validated the pruning strategy works well:
-
-1. **Use pruned data for training:**
-   ```bash
-   # Use stage2_final.json as your training data
-   cp q_tuning_analysis_output/stage2_final.json /path/to/training/data.json
-   ```
-
-2. **Implement dynamic pruning in slime:**
-   - Add PPL/Entropy computation to `slime/backends/megatron_utils/loss.py`
-   - Apply sample filtering per epoch
-   - Apply token masking via `loss_mask`
-
-3. **Expected improvements:**
-   - 30-40% speedup (fewer samples + fewer tokens)
-   - Similar or **better** performance (removes noise)
-   - More stable training (Q4 calibration samples)
-
-## Paper Reference
-
-Wang et al. (2025). "Winning the Pruning Gamble: A Unified Approach to Joint Sample and Token Pruning for Efficient Supervised Fine-Tuning"
-
-Key insights:
-- **First method to consistently outperform full-data training**
-- SmolLM2-1.7B: +38% improvement with only 12.5% data
-- LLaMA3-8B on GSM8K: 48.07 with 35% data (vs 42.08 full-data)
-
-## Questions?
-
-If the results look suspicious:
-1. Check `summary_statistics.json` - are quadrant distributions reasonable?
-2. Open the HTML visualization - do removed tokens make sense?
-3. Sample a few examples from each quadrant manually
-4. Try different `sample_keep_ratio` values (0.3, 0.5, 0.7)
+- Paper: "Winning the Pruning Gamble: A Unified Approach to Joint Sample and Token Pruning" (arXiv:2509.23873)
+- Implementation: `slime/utils/q_tuning_pruner.py`
+- Analysis Script: `tests/test_q_tuning_pruning.py`
