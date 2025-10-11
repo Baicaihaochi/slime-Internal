@@ -492,10 +492,10 @@ class QTuningAnalyzer:
 
                 # Determine threshold (keep top token_keep_ratio tokens)
                 n_keep = max(1, int(len(scores) * self.token_keep_ratio))
-                score_threshold = sorted(scores, reverse=True)[n_keep - 1]
+                score_threshold = sorted(scores)[n_keep - 1]
 
                 # Create token mask
-                token_mask = [1 if s >= score_threshold else 0 for s in scores]
+                token_mask = [1 if s <= score_threshold else 0 for s in scores]
                 sample["metadata"]["token_mask"] = token_mask
                 sample["metadata"]["tokens_kept"] = sum(token_mask)
                 sample["metadata"]["tokens_removed"] = len(token_mask) - sum(token_mask)

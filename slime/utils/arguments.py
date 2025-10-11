@@ -1078,6 +1078,54 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_q_tuning_arguments(parser):
+            """
+            Add Q-Tuning dynamic data pruning arguments.
+            Q-Tuning implements joint sample and token pruning based on the Error-Uncertainty (EU) Plane.
+            Reference: "Winning the Pruning Gamble" (arXiv:2509.23873)
+            """
+            parser.add_argument(
+                "--enable-q-tuning",
+                action="store_true",
+                default=False,
+                help="Enable Q-Tuning dynamic data pruning based on PPL and Entropy",
+            )
+            parser.add_argument(
+                "--q-tuning-sample-keep-ratio",
+                type=float,
+                default=0.5,
+                help=(
+                    "Target ratio of samples to keep after stage 1 (sample-level pruning). "
+                    "The bisection search will find thresholds to achieve this ratio."
+                ),
+            )
+            parser.add_argument(
+                "--q-tuning-token-keep-ratio",
+                type=float,
+                default=0.7,
+                help=(
+                    "Ratio of tokens to keep for Q2 samples in stage 2 (token-level pruning). "
+                    "Q4 samples are kept in full."
+                ),
+            )
+            parser.add_argument(
+                "--q-tuning-neighbor-lambda",
+                type=float,
+                default=0.5,
+                help=(
+                    "Smoothing coefficient for neighbor-aware token scoring. "
+                    "score_i = (1-λ)*PPL_i + λ*(PPL_{i-1}+PPL_{i+1})/2. "
+                    "Range: [0, 1], where 0 means no neighbor smoothing."
+                ),
+            )
+            parser.add_argument(
+                "--q-tuning-bisect-max-iter",
+                type=int,
+                default=10,
+                help="Maximum iterations for bisection search to find optimal thresholds",
+            )
+            return parser
+
         def add_custom_megatron_plugins_arguments(parser):
             """
             Add custom Megatron plugins arguments.
@@ -1162,6 +1210,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
+        parser = add_q_tuning_arguments(parser)
         parser = add_ci_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
 
