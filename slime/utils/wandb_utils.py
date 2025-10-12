@@ -96,6 +96,7 @@ def init_wandb_secondary(args, wandb_run_id, router_addr=None):
             x_update_finish_state=False,
         )
 
+<<<<<<< HEAD
     if args.sglang_enable_metrics and router_addr is not None:
         print(f"Forward SGLang metrics at {router_addr} to WandB.")
         settings_kwargs |= dict(
@@ -107,6 +108,8 @@ def init_wandb_secondary(args, wandb_run_id, router_addr=None):
             },
         )
 
+=======
+>>>>>>> c08d869 (wandb bug fix)
     init_kwargs = {
         "id": wandb_run_id,
         "entity": args.wandb_team,
@@ -117,6 +120,10 @@ def init_wandb_secondary(args, wandb_run_id, router_addr=None):
         "settings": wandb.Settings(**settings_kwargs),
     }
 
+<<<<<<< HEAD
+=======
+
+>>>>>>> c08d869 (wandb bug fix)
     # Add custom directory if specified
     if args.wandb_dir:
         os.makedirs(args.wandb_dir, exist_ok=True)
