@@ -237,6 +237,9 @@ def apply_polaris_to_rollout_data(
             polaris_stats.update({
                 f"polaris/replacer_{k}": v for k, v in replacement_stats.items()
             })
+            for bool_key in ("polaris/replacer_enabled", "polaris/replacer_replaced"):
+                if bool_key in polaris_stats:
+                    polaris_stats[bool_key] = 1.0 if polaris_stats[bool_key] else 0.0
 
             # Optionally skip this batch to align with verl when insufficient good samples
             if (
@@ -304,6 +307,8 @@ def log_polaris_stats(rollout_id, args, polaris_stats):
             if not valid_stats:
                 return
 
+            rank_count = len(valid_stats)
+
             averaged_stats = {}
             all_keys = set().union(*(s.keys() for s in valid_stats))
             for key in all_keys:
@@ -316,6 +321,30 @@ def log_polaris_stats(rollout_id, args, polaris_stats):
                 else:
                     averaged_stats[key] = values[0]
 
+            dp_world_size_with_cp = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            averaged_stats["polaris/dp_world_size"] = dp_world_size_with_cp
+            reward_bucket_keys = [
+                "polaris/reward_0_count",
+                "polaris/reward_mid_count",
+                "polaris/reward_1_count",
+            ]
+            if all(key in averaged_stats for key in reward_bucket_keys):
+                reward_0_avg = averaged_stats["polaris/reward_0_count"]
+                reward_mid_avg = averaged_stats["polaris/reward_mid_count"]
+                reward_1_avg = averaged_stats["polaris/reward_1_count"]
+                batch_total_prompts = (reward_0_avg + reward_mid_avg + reward_1_avg) * rank_count
+                averaged_stats["polaris/batch_total_prompts"] = batch_total_prompts
+                averaged_stats["polaris/batch_solve_none_total"] = reward_0_avg * rank_count
+                averaged_stats["polaris/batch_solve_partial_total"] = reward_mid_avg * rank_count
+                averaged_stats["polaris/batch_solve_all_total"] = reward_1_avg * rank_count
+            if "polaris/replacer_replaced" in averaged_stats:
+                avg_replaced = averaged_stats["polaris/replacer_replaced"]
+                successful_ranks = avg_replaced * rank_count
+                averaged_stats["polaris/replacer_successful_ranks"] = successful_ranks
+                averaged_stats["polaris/replacer_total_ranks"] = rank_count
+                averaged_stats["polaris/replacer_success_rate"] = (
+                    successful_ranks / rank_count if rank_count > 0 else 0.0
+                )
             print(f"POLARIS stats {rollout_id}: {averaged_stats}")
 
             if args.use_wandb:
