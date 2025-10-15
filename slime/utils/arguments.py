@@ -438,6 +438,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "the input should be the same structure as an openai message, e.g. [\{'role': 'user', 'content': 'blabla'\}]. "
                 ),
             )
+            parser.add_argument(
+                "--rollout-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Alias for --prompt-data kept for POLARIS examples. "
+                    "When provided, sets the prompt dataset used for rollouts."
+                ),
+            )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
             # Temporarily be JSON-serialized str, will be a real dict after using Omegaconf
             parser.add_argument("--apply-chat-template-kwargs", type=json.loads, default="{}")
@@ -823,6 +832,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--wandb-host", type=str, default=None)
             parser.add_argument("--wandb-team", type=str, default=None)
             parser.add_argument("--wandb-group", type=str, default=None)
+            parser.add_argument(
+                "--wandb-name",
+                type=str,
+                default=None,
+                help="Alias for --wandb-group preserved for POLARIS examples.",
+            )
             reset_arg(parser, "--wandb-project", type=str, default=None)
             parser.add_argument(
                 "--disable-wandb-random-suffix",
@@ -1183,12 +1198,85 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+<<<<<<< HEAD
         def add_sglang_tp_size():
             temp_parser = argparse.ArgumentParser(add_help=False)
             temp_parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=1)
             temp_args, _ = temp_parser.parse_known_args()
             sglang_tp_size = temp_args.rollout_num_gpus_per_engine
             return sglang_tp_size
+=======
+        def add_polaris_arguments(parser):
+            """
+            Add POLARIS-style training tricks arguments.
+            Implements dynamic sampling and reward tracking from POLARIS paper.
+            """
+            parser.add_argument(
+                "--enable-polaris-dynamic-sampling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable POLARIS dynamic sample replacement. "
+                    "This replaces trivial samples (reward=0 or 1) with medium-difficulty ones "
+                    "during training to improve data quality and training efficiency."
+                ),
+            )
+            parser.add_argument(
+                "--polaris-good-reward-min",
+                type=float,
+                default=0.0,
+                help="Minimum reward (exclusive) for 'good' samples in dynamic sampling.",
+            )
+            parser.add_argument(
+                "--polaris-good-reward-max",
+                type=float,
+                default=1.0,
+                help="Maximum reward (exclusive) for 'good' samples in dynamic sampling.",
+            )
+            parser.add_argument(
+                "--polaris-min-good-ratio",
+                type=float,
+                default=0.33,
+                help=(
+                    "Minimum ratio of good samples required to perform replacement. "
+                    "If less than this ratio, skip replacement and print warning."
+                ),
+            )
+            parser.add_argument(
+                "--enable-polaris-reward-tracking",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable reward tracking to JSONL files for post-training analysis. "
+                    "This enables difficulty-based data filtering between training stages."
+                ),
+            )
+            parser.add_argument(
+                "--polaris-reward-tracking-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Directory to save reward tracking files. "
+                    "Defaults to the same directory as the training data."
+                ),
+            )
+            parser.add_argument(
+                "--polaris-verbose",
+                action="store_true",
+                default=True,
+                help="Print verbose information about POLARIS operations.",
+            )
+            parser.add_argument(
+                "--polaris-skip-batch-when-insufficient",
+                action="store_true",
+                default=False,
+                help=(
+                    "Skip the current batch when insufficient medium-difficulty samples are available "
+                    "(i.e., good ratio <= min_good_ratio). This matches verl's behavior."
+                ),
+            )
+            return parser
+>>>>>>> b25c8ed (POLARIS update)
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
         if add_custom_arguments is not None:
@@ -1211,6 +1299,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_rollout_buffer_arguments(parser)
         parser = add_mtp_training_arguments(parser)
         parser = add_q_tuning_arguments(parser)
+        parser = add_polaris_arguments(parser)
         parser = add_ci_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
 
@@ -1345,7 +1434,21 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
+<<<<<<< HEAD
     args.eval_datasets = _resolve_eval_datasets(args)
+=======
+    # Harmonize backward compatibility aliases used in POLARIS examples.
+    if getattr(args, "rollout_data_path", None) and getattr(args, "prompt_data", None) is None:
+        args.prompt_data = args.rollout_data_path
+    elif getattr(args, "prompt_data", None) is not None and getattr(args, "rollout_data_path", None) is None:
+        args.rollout_data_path = args.prompt_data
+
+    if getattr(args, "wandb_name", None):
+        if getattr(args, "wandb_group", None) is None:
+            args.wandb_group = args.wandb_name
+    else:
+        args.wandb_name = getattr(args, "wandb_group", None)
+>>>>>>> b25c8ed (POLARIS update)
 
     if args.kl_coef != 0 or args.use_kl_loss:
         if not os.path.exists(args.ref_load):

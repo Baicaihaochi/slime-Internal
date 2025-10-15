@@ -13,6 +13,8 @@ import torch.nn.functional as F
 from typing import Dict, List, Tuple, Optional
 import numpy as np
 
+from slime.utils.ppo_utils import calculate_log_probs_and_entropy
+
 
 class QTuningPruner:
     """
@@ -58,41 +60,161 @@ class QTuningPruner:
         Compute sample-level and token-level PPL and Entropy.
 
         Args:
-            model: The language model
+            model: The language model (can be a single model or a list for Megatron PP)
             tokens: Token IDs [seq_len]
             response_start_idx: Index where response starts (prompt_length)
 
         Returns:
             Tuple of (sample_ppl, sample_entropy, token_ppls, token_entropies)
         """
+        # Handle Megatron model list (for Pipeline Parallelism)
+        if isinstance(model, list):
+            # Use the first model in the list (they all share the same forward logic)
+            model = model[0]
+
         with torch.no_grad():
-            # Forward pass
-            outputs = model(tokens.unsqueeze(0), labels=tokens.unsqueeze(0))
-            logits = outputs.logits[0]  # [seq_len, vocab_size]
+            # Store original tokens and seq_len (DO NOT modify the input parameter!)
+            original_tokens = tokens
+            seq_len = tokens.size(0)
+
+            # Get tensor parallel size (required for Sequence Parallelism padding)
+            try:
+                from megatron.core import parallel_state as mpu
+
+                tp_size = mpu.get_tensor_model_parallel_world_size()
+                tp_group = mpu.get_tensor_model_parallel_group()
+            except Exception:
+                tp_size = 1
+                tp_group = None
+
+            # For Sequence Parallelism: BOTH batch_size and seq_len must be divisible by TP size
+            # Pad sequence length if needed
+            padded_seq_len = seq_len
+            if seq_len % tp_size != 0:
+                padded_seq_len = ((seq_len + tp_size - 1) // tp_size) * tp_size
+
+            # Create padded tokens (DO NOT modify original tokens!)
+            if padded_seq_len > seq_len:
+                pad_length = padded_seq_len - seq_len
+                # Pad with zeros (or model's pad_token_id if available)
+                padded_tokens = torch.cat([original_tokens, torch.zeros(pad_length, dtype=original_tokens.dtype, device=original_tokens.device)])
+            else:
+                padded_tokens = original_tokens
+
+            # Ensure batch_size is also divisible by TP size
+            batch_size = max(tp_size, 1)
+            batch_tokens = padded_tokens.unsqueeze(0).expand(batch_size, -1)  # [batch_size, padded_seq_len]
+
+            # Create position_ids: [batch_size, padded_seq_len]
+            position_ids = torch.arange(padded_seq_len, dtype=torch.long, device=original_tokens.device).unsqueeze(0).expand(batch_size, -1)
+
+            # Create attention_mask: [batch_size, 1, padded_seq_len, padded_seq_len]
+            # For padded tokens, mask them out in attention
+            attention_mask = torch.tril(
+                torch.ones((padded_seq_len, padded_seq_len), dtype=torch.bool, device=original_tokens.device)
+            )
+            # Mask out padded positions
+            attention_mask[seq_len:, :] = False
+            attention_mask[:, seq_len:] = False
+            attention_mask = attention_mask.unsqueeze(0).unsqueeze(0).expand(batch_size, 1, -1, -1)
+
+            # Forward pass with padded inputs
+            # Megatron models return logits directly as a tensor, not wrapped in an object
+            outputs = model(
+                input_ids=batch_tokens,
+                position_ids=position_ids,
+                attention_mask=attention_mask,
+                labels=None,  # We don't need loss computation
+            )
+
+            # Extract logits from the first sample, only keep original sequence length
+            # outputs is a tensor of shape [batch_size, padded_seq_len, vocab_size]
+            logits = outputs[0, :seq_len, :]  # [seq_len, vocab_size]
 
             # Compute token-level metrics for response tokens
-            token_ppls = []
-            token_entropies = []
+            # IMPORTANT: Use seq_len (not len(tokens)) to avoid accessing padded tokens
+            eval_indices = list(range(response_start_idx, seq_len))
+            if not eval_indices:
+                return 0.0, 0.0, [], []
 
-            for i in range(response_start_idx, len(tokens)):
-                # Get logits for predicting token i (using logits at position i-1)
-                token_logits = logits[i - 1]
-                log_probs = F.log_softmax(token_logits, dim=-1)
-                probs = torch.exp(log_probs)
+            token_ppls: List[float] = []
+            token_entropies: List[float] = []
 
-                # Token perplexity
-                true_token_id = tokens[i]
-                token_nll = -log_probs[true_token_id].item()
-                token_ppl = np.exp(token_nll)
-                token_ppls.append(token_ppl)
+            use_vocab_parallel_ops = False
+            if tp_group is not None:
+                dist_module = getattr(torch, "distributed", None)
+                if dist_module is not None:
+                    try:
+                        use_vocab_parallel_ops = dist_module.is_available() and dist_module.is_initialized()
+                    except RuntimeError:
+                        use_vocab_parallel_ops = False
 
-                # Token entropy
-                entropy = -(probs * log_probs).sum().item()
-                token_entropies.append(entropy)
+            if use_vocab_parallel_ops:
+                logits_indices = []
+                for idx in eval_indices:
+                    prev_idx = idx - 1
+                    # Skip the first token if prev_idx < 0 (can't predict first token from nothing)
+                    if prev_idx < 0:
+                        continue
+                    logits_indices.append(prev_idx)
 
-            # Sample-level metrics (average over response tokens)
-            sample_ppl = np.exp(np.mean([np.log(p) for p in token_ppls]))
-            sample_entropy = np.mean(token_entropies)
+                # If no valid indices, return default values
+                if not logits_indices:
+                    return 1.0, 0.0, [], []
+
+                # Update eval_indices to match (skip first token if needed)
+                valid_eval_indices = [idx for idx in eval_indices if idx > 0]
+
+                logits_for_targets = logits[logits_indices].contiguous()
+                target_tokens = original_tokens[valid_eval_indices].contiguous()
+
+                log_probs_tensor, entropy_tensor = calculate_log_probs_and_entropy(
+                    logits_for_targets,
+                    target_tokens,
+                    tp_group,
+                    with_entropy=True,
+                )
+
+                log_probs_tensor = log_probs_tensor.squeeze(-1)
+                entropy_tensor = entropy_tensor.squeeze(-1)
+                token_nlls = -log_probs_tensor
+
+                # Clamp to avoid numerical issues
+                token_nlls = torch.clamp(token_nlls, min=0.0, max=50.0)
+                token_ppls_tensor = token_nlls.exp()
+
+                sample_ppl = float(token_nlls.mean().exp().item())
+                sample_entropy = float(entropy_tensor.mean().item())
+                token_ppls = [float(v) for v in token_ppls_tensor.cpu().tolist()]
+                token_entropies = [float(v) for v in entropy_tensor.cpu().tolist()]
+            else:
+                for idx in eval_indices:
+                    prev_idx = idx - 1
+                    # Skip the first token if prev_idx < 0 (can't predict first token from nothing)
+                    if prev_idx < 0:
+                        continue
+
+                    token_logits = logits[prev_idx]
+                    log_probs = F.log_softmax(token_logits, dim=-1)
+                    probs = torch.exp(log_probs)
+
+                    true_token_id = original_tokens[idx]
+                    token_nll = -log_probs[true_token_id].item()
+                    # Clamp to avoid numerical explosion
+                    token_nll = np.clip(token_nll, 0.0, 50.0)
+                    token_ppl = np.exp(token_nll)
+                    token_ppls.append(token_ppl)
+
+                    entropy = -(probs * log_probs).sum().item()
+                    token_entropies.append(entropy)
+
+                # If no tokens were processed, return defaults
+                if not token_ppls:
+                    return 1.0, 0.0, [], []
+
+                # Use mean of log(ppl) for numerical stability
+                sample_ppl = np.exp(np.mean([np.log(max(p, 1e-10)) for p in token_ppls]))
+                sample_entropy = np.mean(token_entropies)
 
             return sample_ppl, sample_entropy, token_ppls, token_entropies
 
@@ -239,7 +361,8 @@ class QTuningPruner:
         tokens: torch.Tensor,
         token_ppls: List[float],
         response_start_idx: int,
-    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        base_loss_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
         """
         Prune tokens based on neighbor-aware scoring.
 
@@ -249,29 +372,48 @@ class QTuningPruner:
             response_start_idx: Index where response starts
 
         Returns:
-            Tuple of (pruned_tokens, new_loss_mask)
+            Loss mask tensor for response tokens only (length = response_len).
         """
-        # Compute scores
         scores = self.neighbor_aware_token_scoring(token_ppls)
 
-        # Keep top-k tokens
         num_keep = max(1, int(len(scores) * self.token_keep_ratio))
-        sorted_indices = np.argsort(scores)[:num_keep]  # Keep lowest scores (lowest PPL)
-        sorted_indices = np.sort(sorted_indices)  # Restore order
+        sorted_indices = np.argsort(scores)[:num_keep]
+        sorted_indices = np.sort(sorted_indices)
 
-        # Build pruned tokens and loss mask
-        prompt_tokens = tokens[:response_start_idx]
         response_tokens = tokens[response_start_idx:]
 
-        # Keep selected response tokens
-        kept_response_tokens = response_tokens[sorted_indices]
-        pruned_tokens = torch.cat([prompt_tokens, kept_response_tokens])
+        response_len = response_tokens.size(0)
+        if base_loss_mask is not None:
+            base_mask = base_loss_mask.detach()
+            if base_mask.dim() != 1:
+                raise ValueError(f"Expected 1D loss mask, got shape {base_mask.shape}")
+            if base_mask.size(0) not in (response_len, tokens.size(0)):
+                raise ValueError(
+                    f"Loss mask length {base_mask.size(0)} incompatible with response length {response_len}"
+                )
+            if base_mask.size(0) == tokens.size(0):
+                base_mask = base_mask[response_start_idx:]
+            base_mask = base_mask.to(torch.long)
+        else:
+            base_mask = torch.ones(response_len, dtype=torch.long, device=tokens.device)
 
-        # Build loss mask (0 for prompt, 1 for kept response tokens)
-        loss_mask = torch.zeros(len(pruned_tokens), dtype=torch.long)
-        loss_mask[response_start_idx:] = 1
+        kept_indices = torch.from_numpy(sorted_indices).long()
+        if kept_indices.numel() == response_len:
+            new_mask = base_mask.clone()
+        else:
+            new_mask = torch.zeros_like(base_mask)
+            kept_indices_device = kept_indices.to(new_mask.device)
+            new_mask[kept_indices_device] = base_mask[kept_indices_device]
 
-        return pruned_tokens, loss_mask
+        if new_mask.sum() == 0:
+            print(
+                "[Q-Tuning Warning] All tokens masked out; forcing one token to remain for stability."
+            )
+            first_idx = kept_indices[0].item() if kept_indices.numel() > 0 else 0
+            first_idx = int(min(max(first_idx, 0), response_len - 1))
+            new_mask[first_idx] = 1
+
+        return new_mask.to(tokens.device)
 
     def prune_batch(
         self,
@@ -292,10 +434,12 @@ class QTuningPruner:
         """
         tokens_list = rollout_data["tokens"]
         response_lengths = rollout_data["response_lengths"]
+        loss_masks_list = rollout_data.get("loss_masks")
+        total_lengths_list = rollout_data.get("total_lengths")
 
         # Stage 1: Compute PPL and Entropy for all samples
         sample_metrics = []
-        for tokens, resp_len in zip(tokens_list, response_lengths):
+        for idx, (tokens, resp_len) in enumerate(zip(tokens_list, response_lengths)):
             prompt_len = len(tokens) - resp_len
             ppl, ent, token_ppls, token_ents = self.compute_ppl_and_entropy(
                 model, tokens, prompt_len
@@ -307,6 +451,9 @@ class QTuningPruner:
                 "token_entropies": token_ents,
                 "tokens": tokens,
                 "response_start_idx": prompt_len,
+                "original_response_length": resp_len,
+                "loss_mask": loss_masks_list[idx] if loss_masks_list is not None else None,
+                "total_length": total_lengths_list[idx] if total_lengths_list is not None else len(tokens),
             })
 
         # Find thresholds via bisection search
@@ -331,22 +478,28 @@ class QTuningPruner:
             if quadrant in ["Q2", "Q4"]:
                 kept_indices.append(idx)
 
+                tokens = metrics["tokens"]
+                base_loss_mask = metrics["loss_mask"]
+                response_start_idx = metrics["response_start_idx"]
+
                 if quadrant == "Q2":
-                    # Apply token pruning to Q2
-                    pruned_tokens, loss_mask = self.prune_tokens(
-                        metrics["tokens"],
+                    loss_mask = self.prune_tokens(
+                        tokens,
                         metrics["token_ppls"],
-                        metrics["response_start_idx"],
+                        response_start_idx,
+                        base_loss_mask=base_loss_mask,
                     )
-                    pruned_tokens_list.append(pruned_tokens)
-                    pruned_loss_masks.append(loss_mask)
                 else:
-                    # Keep Q4 samples in full
-                    tokens = metrics["tokens"]
-                    loss_mask = torch.zeros(len(tokens), dtype=torch.long)
-                    loss_mask[metrics["response_start_idx"]:] = 1
-                    pruned_tokens_list.append(tokens)
-                    pruned_loss_masks.append(loss_mask)
+                    if base_loss_mask is not None:
+                        # base_loss_mask should already be response-only
+                        loss_mask = base_loss_mask.clone()
+                    else:
+                        # Create response-only mask (all 1s)
+                        response_length = len(tokens) - response_start_idx
+                        loss_mask = torch.ones(response_length, dtype=torch.long, device=tokens.device)
+
+                pruned_tokens_list.append(tokens)
+                pruned_loss_masks.append(loss_mask)
 
         # Build pruned rollout_data
         pruned_rollout_data = {}
@@ -365,12 +518,11 @@ class QTuningPruner:
         # Update response_lengths and total_lengths
         if "response_lengths" in pruned_rollout_data:
             pruned_rollout_data["response_lengths"] = [
-                len(tokens) - sample_metrics[i]["response_start_idx"]
-                for i, tokens in zip(kept_indices, pruned_tokens_list)
+                sample_metrics[i]["original_response_length"] for i in kept_indices
             ]
 
         if "total_lengths" in pruned_rollout_data:
-            pruned_rollout_data["total_lengths"] = [len(tokens) for tokens in pruned_tokens_list]
+            pruned_rollout_data["total_lengths"] = [sample_metrics[i]["total_length"] for i in kept_indices]
 
         # Log statistics
         print(f"[Q-Tuning] Quadrant distribution: {quadrant_counts}")

@@ -53,17 +53,132 @@ def get_responses(
     assert logits.size(0) == 1, f"{logits.shape}"
     assert logits.dtype == torch.float32, f"{logits.dtype}"
 
+    def _dump_non_finite(
+        prefix: str,
+        tensor: torch.Tensor,
+        sample_idx: int,
+        total_length: int,
+        response_length: int,
+        extra: dict | None = None,
+        tokens: torch.Tensor | None = None,
+    ):
+        try:
+            mask = ~torch.isfinite(tensor)
+            num_bad = int(mask.sum().item())
+            first_pos = mask.nonzero(as_tuple=False)[0].tolist() if num_bad > 0 else None
+
+            tensor_cpu = tensor.detach().float().cpu()
+            finite_tensor_cpu = torch.where(
+                torch.isfinite(tensor_cpu), tensor_cpu, torch.zeros_like(tensor_cpu)
+            )
+            max_abs = finite_tensor_cpu.abs().max().item()
+
+            token_stats = None
+            if tokens is not None and tokens.numel() > 0:
+                tokens_cpu = tokens.detach().long().cpu()
+                token_stats = {
+                    "min": int(tokens_cpu.min().item()),
+                    "max": int(tokens_cpu.max().item()),
+                    "mean": float(tokens_cpu.float().mean().item()),
+                }
+
+            rank = -1
+            dist_module = getattr(torch, "distributed", None)
+            if dist_module is not None and dist_module.is_available() and dist_module.is_initialized():
+                rank = dist_module.get_rank()
+
+            payload = {
+                "prefix": prefix,
+                "sample_idx": sample_idx,
+                "total_length": total_length,
+                "response_length": response_length,
+                "num_bad": num_bad,
+                "first_bad_position": first_pos,
+                "max_abs": max_abs,
+                "extra": extra,
+                "token_stats": token_stats,
+            }
+
+            path = f"/tmp/q_tuning_bad_logits_rank{rank}_sample{sample_idx}_{prefix.replace(' ', '_')}.pt"
+            payload["tensor"] = tensor_cpu
+            if tokens is not None:
+                payload["tokens"] = tokens.detach().cpu()
+            torch.save(payload, path)
+            print(
+                f"[Q-Tuning Debug] Saved non-finite tensor snapshot to {path} "
+                f"(prefix={prefix}, num_bad={num_bad}, first_bad_position={first_pos}, max_abs={max_abs})",
+                flush=True,
+            )
+        except Exception as exc:  # pragma: no cover - best-effort debug aid
+            print(
+                f"[Q-Tuning Debug] Failed to dump non-finite tensor (prefix={prefix}, sample_idx={sample_idx}): {exc}",
+                flush=True,
+            )
+
     logits = logits.squeeze(0)
     logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
+<<<<<<< HEAD
+=======
+    log_probs_list = []
+    if with_entropy:
+        entropy_list = []
+>>>>>>> b25c8ed (POLARIS update)
     end = 0
-    for tokens, total_length, response_length in zip(unconcat_tokens, total_lengths, response_lengths):
+    for sample_idx, (tokens, total_length, response_length) in enumerate(
+        zip(unconcat_tokens, total_lengths, response_lengths)
+    ):
         if cp_size == 1:
             end += total_length
             start = end - response_length
             logits_chunk = logits[start - 1 : end - 1]
             tokens_chunk = tokens[-response_length:]
+<<<<<<< HEAD
+=======
+
+            sanitized = False
+            if not torch.isfinite(logits_chunk).all():
+                _dump_non_finite(
+                    "chunk_0_non_cp",
+                    logits_chunk,
+                    sample_idx,
+                    total_length,
+                    response_length,
+                    extra={
+                        "start": start,
+                        "end": end,
+                        "path": "non_cp",
+                    },
+                    tokens=tokens_chunk,
+                )
+                logits_chunk = torch.nan_to_num(
+                    logits_chunk, nan=0.0, posinf=1e4, neginf=-1e4
+                )
+                sanitized = True
+
+            tp_world_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+            local_vocab_size = logits_chunk.size(-1)
+            global_vocab_upper_bound = local_vocab_size * tp_world_size
+            token_max_val = tokens_chunk.max().item()
+            token_min_val = tokens_chunk.min().item()
+            if token_max_val >= global_vocab_upper_bound or token_min_val < 0:
+                print(
+                    "[Q-Tuning] Token index out of bounds detected "
+                    f"(sample_idx={sample_idx}, global_vocab_upper_bound={global_vocab_upper_bound}, "
+                    f"token_min={token_min_val}, token_max={token_max_val}, "
+                    f"total_length={total_length}, response_length={response_length})"
+                )
+                raise RuntimeError("Token index out of vocabulary range before log prob computation.")
+
+            if sanitized:
+                log_prob = logits.new_zeros(response_length)
+                entropy = logits.new_zeros(response_length) if with_entropy else None
+            else:
+                log_prob, entropy = calculate_log_probs_and_entropy(
+                    logits_chunk, tokens_chunk, mpu.get_tensor_model_parallel_group(), with_entropy=with_entropy
+                )
+>>>>>>> b25c8ed (POLARIS update)
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
@@ -82,8 +197,80 @@ def get_responses(
             assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}"
             assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}"
 
+<<<<<<< HEAD
             logits_chunk = torch.cat([logits_0, logits_1], dim=0)
             tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
+=======
+            sanitized = False
+            if not torch.isfinite(logits_0).all():
+                _dump_non_finite(
+                    "chunk_0_cp",
+                    logits_0,
+                    sample_idx,
+                    total_length,
+                    response_length,
+                    extra={"part": 0, "path": "cp"},
+                    tokens=tokens_0,
+                )
+                logits_0 = torch.nan_to_num(logits_0, nan=0.0, posinf=1e4, neginf=-1e4)
+                sanitized = True
+            if not torch.isfinite(logits_1).all():
+                _dump_non_finite(
+                    "chunk_1_cp",
+                    logits_1,
+                    sample_idx,
+                    total_length,
+                    response_length,
+                    extra={"part": 1, "path": "cp"},
+                    tokens=tokens_1,
+                )
+                logits_1 = torch.nan_to_num(logits_1, nan=0.0, posinf=1e4, neginf=-1e4)
+                sanitized = True
+
+            tp_world_size = max(mpu.get_tensor_model_parallel_world_size(), 1)
+            local_vocab_size = logits_0.size(-1)
+            global_vocab_upper_bound = local_vocab_size * tp_world_size
+            token_max_candidates = []
+            token_min_candidates = []
+            if tokens_0.numel() > 0:
+                token_max_candidates.append(tokens_0.max())
+                token_min_candidates.append(tokens_0.min())
+            if tokens_1.numel() > 0:
+                token_max_candidates.append(tokens_1.max())
+                token_min_candidates.append(tokens_1.min())
+
+            if token_max_candidates:
+                token_max = torch.stack(token_max_candidates).max().item()
+                token_min = torch.stack(token_min_candidates).min().item()
+                if token_max >= global_vocab_upper_bound or token_min < 0:
+                    print(
+                        "[Q-Tuning] Token index out of bounds detected (CP path) "
+                        f"(sample_idx={sample_idx}, global_vocab_upper_bound={global_vocab_upper_bound}, "
+                        f"token_min={token_min}, token_max={token_max}, "
+                        f"total_length={total_length}, response_length={response_length})"
+                    )
+                    raise RuntimeError("Token index out of vocabulary range before log prob computation.")
+
+            if sanitized:
+                log_prob = logits.new_zeros(response_length)
+                entropy = logits.new_zeros(response_length) if with_entropy else None
+            else:
+                log_prob_0, entropy_0 = calculate_log_probs_and_entropy(
+                    logits_0,
+                    tokens_0,
+                    mpu.get_tensor_model_parallel_group(),
+                    with_entropy=with_entropy,
+                )
+                log_prob_1, entropy_1 = calculate_log_probs_and_entropy(
+                    logits_1,
+                    tokens_1,
+                    mpu.get_tensor_model_parallel_group(),
+                    with_entropy=with_entropy,
+                )
+                log_prob = torch.cat([log_prob_0, log_prob_1], dim=0)
+                if with_entropy:
+                    entropy = torch.cat([entropy_0, entropy_1], dim=0)
+>>>>>>> b25c8ed (POLARIS update)
 
         yield logits_chunk, tokens_chunk
 
@@ -676,9 +863,56 @@ def sft_loss_function(
         with_entropy=False,
     )
 
-    log_probs = log_probs_and_entropy["log_probs"]
-    log_probs = torch.cat(log_probs, dim=0)
+    log_probs_list = log_probs_and_entropy["log_probs"]
+
+    non_finite_info = []
+    for sample_idx, (log_prob_tensor, resp_len, tot_len, loss_mask) in enumerate(
+        zip(
+            log_probs_list,
+            batch.get("response_lengths", []),
+            batch.get("total_lengths", []),
+            batch.get("loss_masks", []),
+        )
+    ):
+        if not torch.isfinite(log_prob_tensor).all():
+            non_finite_values = log_prob_tensor[~torch.isfinite(log_prob_tensor)]
+            non_finite_info.append(
+                {
+                    "idx": sample_idx,
+                    "count": non_finite_values.numel(),
+                    "min": non_finite_values.min().item()
+                    if non_finite_values.numel() > 0
+                    else float("nan"),
+                    "max": non_finite_values.max().item()
+                    if non_finite_values.numel() > 0
+                    else float("nan"),
+                    "response_length": resp_len,
+                    "total_length": tot_len,
+                    "loss_mask_sum": loss_mask.sum().item()
+                    if isinstance(loss_mask, torch.Tensor)
+                    else None,
+                }
+            )
+
+    log_probs = torch.cat(log_probs_list, dim=0)
     loss = -sum_of_sample_mean(log_probs)
+
+    if not torch.isfinite(loss) or non_finite_info:
+        loss_mask_sums = (
+            [mask.sum().item() for mask in batch.get("loss_masks", [])]
+            if isinstance(batch.get("loss_masks", None), list)
+            else None
+        )
+        print(
+            "[Q-Tuning] Non-finite loss detected. "
+            f"loss={loss}, "
+            f"num_log_probs={log_probs.numel()}, "
+            f"loss_mask_sums={loss_mask_sums}, "
+            f"response_lengths={batch.get('response_lengths', None)}, "
+            f"total_lengths={batch.get('total_lengths', None)}, "
+            f"non_finite_info={non_finite_info}"
+        )
+        raise RuntimeError("Encountered non-finite loss during SFT training.")
 
     # make sure the gradient could backprop correctly.
     if log_probs.numel() == 0:

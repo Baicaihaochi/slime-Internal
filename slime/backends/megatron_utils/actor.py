@@ -32,6 +32,7 @@ from .data import DataIterator, get_data_iterator, log_perf_data, log_rollout_da
 from .initialize import init, is_megatron_main_rank
 from .loss import compute_advantages_and_returns, get_log_probs_and_entropy, get_values
 from .model import forward_only, initialize_model_and_optimizer, save, train
+from .polaris_integration import apply_polaris_to_rollout_data, init_polaris_components, log_polaris_stats
 from .update_weight_utils import UpdateWeightFromDistributed, UpdateWeightFromTensor, named_parameters
 
 
@@ -121,6 +122,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof = TrainProfiler(args)
 
+<<<<<<< HEAD
+=======
+        # Q-Tuning reservoir to accumulate pruned samples until we can form full microbatches
+        self._q_tuning_sample_pool: dict | None = None
+
+        # POLARIS components initialization
+        self.reward_tracker, self.dynamic_replacer = init_polaris_components(args)
+
+        Timer().start("train_wait")
+>>>>>>> b25c8ed (POLARIS update)
         return start_rollout_id
 
     @torch.no_grad()
@@ -189,6 +200,51 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
         return rollout_data
 
+    def _q_tuning_prepare_batch(self, pruned_rollout_data: dict | None) -> dict | None:
+        if pruned_rollout_data is None:
+            return None
+
+        required_per_rank = self.args.global_batch_size // mpu.get_data_parallel_world_size(with_context_parallel=False)
+        if required_per_rank == 0:
+            return pruned_rollout_data
+
+        if self._q_tuning_sample_pool is None:
+            self._q_tuning_sample_pool = {}
+
+        pool = self._q_tuning_sample_pool
+
+        for key, val in pruned_rollout_data.items():
+            if isinstance(val, list):
+                if key not in pool:
+                    pool[key] = []
+                pool[key].extend(val)
+            else:
+                if key not in pool:
+                    pool[key] = val
+                else:
+                    pool[key] = val
+
+        total_buffered = len(pool.get("tokens", []))
+        if total_buffered < required_per_rank:
+            return None
+
+        ready_count = (total_buffered // required_per_rank) * required_per_rank
+        if ready_count == 0:
+            return None
+
+        ready_batch: dict = {}
+        for key in list(pool.keys()):
+            val = pool[key]
+            if isinstance(val, list):
+                selected = val[:ready_count]
+                ready_batch[key] = selected
+                remaining = val[ready_count:]
+                pool[key] = remaining
+            else:
+                ready_batch[key] = val
+
+        return ready_batch
+
     def compute_log_prob(
         self,
         model_tag: str,
@@ -223,6 +279,7 @@ class MegatronTrainRayActor(TrainRayActor):
         else:
             return self.train_actor(rollout_id, rollout_data)
 
+<<<<<<< HEAD
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
         # Q-Tuning: Dynamic data pruning based on PPL and Entropy
         if self.args.enable_q_tuning:
@@ -236,6 +293,45 @@ class MegatronTrainRayActor(TrainRayActor):
                     bisect_max_iter=self.args.q_tuning_bisect_max_iter,
                 )
                 rollout_data = pruner.prune_batch(self.model, rollout_data)
+=======
+                # POLARIS: Apply dynamic sampling and reward tracking
+                # This should be done BEFORE Q-Tuning and compute_advantages_and_returns
+                polaris_stats = {}
+                if self.args.enable_polaris_dynamic_sampling or self.args.enable_polaris_reward_tracking:
+                    with timer("polaris_processing"):
+                        rollout_data, polaris_stats = apply_polaris_to_rollout_data(
+                            self.args,
+                            rollout_data,
+                            rollout_id,
+                            self.reward_tracker,
+                            self.dynamic_replacer,
+                        )
+
+                        # If configured to skip batch when insufficient good samples (verl behavior)
+                        if polaris_stats.get("polaris/skip_batch_due_to_insufficient_good", 0) == 1:
+                            print("[POLARIS] Skip this batch due to insufficient medium-difficulty samples.")
+                            Timer().start("train_wait")
+                            return
+
+                # Q-Tuning: Dynamic data pruning based on PPL and Entropy
+                if self.args.enable_q_tuning:
+                    with timer("q_tuning_pruning"):
+                        from slime.utils.q_tuning_pruner import QTuningPruner
+
+                        pruner = QTuningPruner(
+                            sample_keep_ratio=self.args.q_tuning_sample_keep_ratio,
+                            token_keep_ratio=self.args.q_tuning_token_keep_ratio,
+                            neighbor_lambda=self.args.q_tuning_neighbor_lambda,
+                            bisect_max_iter=self.args.q_tuning_bisect_max_iter,
+                        )
+                        pruned_data = pruner.prune_batch(self.model, rollout_data)
+
+                    rollout_data = self._q_tuning_prepare_batch(pruned_data)
+                    if rollout_data is None:
+                        print("[Q-Tuning] Accumulating samples; insufficient data for a full microbatch.")
+                        Timer().start("train_wait")
+                        return
+>>>>>>> b25c8ed (POLARIS update)
 
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
@@ -313,6 +409,16 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
+<<<<<<< HEAD
+=======
+            # Log POLARIS statistics
+            if polaris_stats:
+                log_polaris_stats(rollout_id, self.args, polaris_stats)
+
+            if self.args.use_pytorch_profiler and torch.distributed.get_rank() == 0 and self.prof is not None:
+                self.prof.step()
+
+>>>>>>> b25c8ed (POLARIS update)
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"

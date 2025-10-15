@@ -12,5 +12,5 @@ MODEL_ARGS=(
    --rotary-base 10000
    --group-query-attention
    --num-query-groups 2
-   --vocab-size 151936
+   --vocab-size 152064
 )

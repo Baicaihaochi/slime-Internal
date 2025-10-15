@@ -22,12 +22,50 @@ def read_file(path):
         df = pd.read_json(path, lines=True, dtype={"label": str})
     elif path.endswith(".parquet"):
         df = pd.read_parquet(path, dtype_backend="pyarrow")
+    elif path.endswith(".json"):
+        # Support .json format (both list and columnar)
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+
+        # Handle different JSON formats
+        if isinstance(data, list):
+            # Standard list format: [{"key": "value"}, ...]
+            for item in data:
+                yield item
+        elif isinstance(data, dict):
+            # Columnar format: {"key": {"0": ..., "1": ...}, ...}
+            # or indexed format: {"0": {...}, "1": {...}}
+
+            # Check if it's columnar format (has keys like "conversations", "problem", etc.)
+            first_key = list(data.keys())[0]
+            if isinstance(data[first_key], dict):
+                # Determine number of samples
+                num_samples = len(data[first_key])
+
+                # Convert columnar to row format
+                for idx in range(num_samples):
+                    idx_str = str(idx)
+                    item = {}
+                    for key in data.keys():
+                        if isinstance(data[key], dict) and idx_str in data[key]:
+                            item[key] = data[key][idx_str]
+                    yield item
+            else:
+                # Single sample dict
+                yield data
+        else:
+            raise ValueError(f"Unsupported JSON structure: {type(data)}")
+        return
     else:
+<<<<<<< HEAD
         raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
 
     if row_slice is not None:
         print(f"read_file path={path} slice {len(df)=} rows into {row_slice=}")
         df = df.iloc[row_slice]
+=======
+        raise ValueError(f"Unsupported file format: {path}. Supported formats are .json, .jsonl and .parquet.")
+>>>>>>> b25c8ed (POLARIS update)
 
     for _, row in df.iterrows():
         yield row.to_dict()
@@ -101,11 +139,16 @@ class Dataset:
                     if len(raw_prompt_ids) > max_length:
                         continue
 
+            metadata = data.get(metadata_key) or {}
+            if not isinstance(metadata, dict):
+                metadata = {}
+            metadata.setdefault("dataset_index", len(self.origin_samples))
+
             self.origin_samples.append(
                 Sample(
                     prompt=prompt,
                     label=data[label_key] if label_key is not None else None,
-                    metadata=data.get(metadata_key) or {},
+                    metadata=metadata,
                 )
             )
 
@@ -157,7 +200,7 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
         data = data[0]
 
     # save the unprocessed reward for logging
-    rollout_data["raw_reward"] = data["raw_reward"]
+    # rollout_data["raw_reward"] = data["raw_reward"]
 
     if "prompt" in data:
         rollout_data["prompt"] = data["prompt"]
@@ -199,12 +242,13 @@ def process_rollout_data(args, rollout_data_ref, dp_rank, dp_size):
             return [val[i] for i in parititions[dp_rank]]
         else:
             return val[dp_rank::dp_size]
-
+    # add raw_reward in dp
     for key in [
         "tokens",
         "total_lengths",
         "response_lengths",
         "rewards",
+        "raw_reward",
         "truncated",
         "loss_masks",
         "round_number",
