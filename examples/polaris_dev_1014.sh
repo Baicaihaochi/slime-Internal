@@ -67,7 +67,7 @@ ROLLOUT_ARGS=(
    --rollout-max-response-len ${ROLLOUT_MAX_RESPONSE_LEN}
    --rollout-temperature ${ROLLOUT_TEMPERATURE}
    --over-sampling-batch-size ${OVER_SAMPLING_BATCH_SIZE}  # ${gen_prompt_bsz}
-   --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
+   # --dynamic-sampling-filter-path slime.rollout.filter_hub.dynamic_sampling_filters.check_reward_nonzero_std
 
    --global-batch-size ${GLOBAL_BATCH_SIZE}  # ${train_prompt_bsz}
    --balance-data
