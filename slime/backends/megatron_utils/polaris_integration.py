@@ -240,6 +240,9 @@ def apply_polaris_to_rollout_data(
             for bool_key in ("polaris/replacer_enabled", "polaris/replacer_replaced"):
                 if bool_key in polaris_stats:
                     polaris_stats[bool_key] = 1.0 if polaris_stats[bool_key] else 0.0
+            for bool_key in ("polaris/replacer_enabled", "polaris/replacer_replaced"):
+                if bool_key in polaris_stats:
+                    polaris_stats[bool_key] = 1.0 if polaris_stats[bool_key] else 0.0
 
             # Optionally skip this batch to align with verl when insufficient good samples
             if (
@@ -309,6 +312,20 @@ def log_polaris_stats(rollout_id, args, polaris_stats):
 
             rank_count = len(valid_stats)
 
+            dp_world_size_with_cp = mpu.get_data_parallel_world_size(with_context_parallel=True)
+            dp_world_size_without_cp = mpu.get_data_parallel_world_size(with_context_parallel=False)
+
+            cp_world_size_fn = getattr(mpu, "get_context_parallel_world_size", None)
+            cp_world_size = cp_world_size_fn() if cp_world_size_fn is not None else 1
+
+            expected_controller_count = dp_world_size_with_cp
+            assert rank_count == expected_controller_count, (
+                f"Missing POLARIS stats: expected {expected_controller_count} controller reports, "
+                f"got {rank_count}. This may indicate a crash, early exit, or communication issue in one or more ranks."
+            )
+
+            rank_count = len(valid_stats)
+
             averaged_stats = {}
             all_keys = set().union(*(s.keys() for s in valid_stats))
             for key in all_keys:
@@ -321,8 +338,9 @@ def log_polaris_stats(rollout_id, args, polaris_stats):
                 else:
                     averaged_stats[key] = values[0]
 
-            dp_world_size_with_cp = mpu.get_data_parallel_world_size(with_context_parallel=True)
             averaged_stats["polaris/dp_world_size"] = dp_world_size_with_cp
+            averaged_stats["polaris/dp_world_size_without_cp"] = dp_world_size_without_cp
+            averaged_stats["polaris/cp_world_size"] = cp_world_size
             reward_bucket_keys = [
                 "polaris/reward_0_count",
                 "polaris/reward_mid_count",
@@ -332,11 +350,11 @@ def log_polaris_stats(rollout_id, args, polaris_stats):
                 reward_0_avg = averaged_stats["polaris/reward_0_count"]
                 reward_mid_avg = averaged_stats["polaris/reward_mid_count"]
                 reward_1_avg = averaged_stats["polaris/reward_1_count"]
-                batch_total_prompts = (reward_0_avg + reward_mid_avg + reward_1_avg) * rank_count
+                batch_total_prompts = (reward_0_avg + reward_mid_avg + reward_1_avg) * dp_world_size_without_cp
                 averaged_stats["polaris/batch_total_prompts"] = batch_total_prompts
-                averaged_stats["polaris/batch_solve_none_total"] = reward_0_avg * rank_count
-                averaged_stats["polaris/batch_solve_partial_total"] = reward_mid_avg * rank_count
-                averaged_stats["polaris/batch_solve_all_total"] = reward_1_avg * rank_count
+                averaged_stats["polaris/batch_solve_none_total"] = reward_0_avg * dp_world_size_without_cp
+                averaged_stats["polaris/batch_solve_partial_total"] = reward_mid_avg * dp_world_size_without_cp
+                averaged_stats["polaris/batch_solve_all_total"] = reward_1_avg * dp_world_size_without_cp
             if "polaris/replacer_replaced" in averaged_stats:
                 avg_replaced = averaged_stats["polaris/replacer_replaced"]
                 successful_ranks = avg_replaced * rank_count
