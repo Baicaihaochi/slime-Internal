@@ -240,9 +240,6 @@ def apply_polaris_to_rollout_data(
             for bool_key in ("polaris/replacer_enabled", "polaris/replacer_replaced"):
                 if bool_key in polaris_stats:
                     polaris_stats[bool_key] = 1.0 if polaris_stats[bool_key] else 0.0
-            for bool_key in ("polaris/replacer_enabled", "polaris/replacer_replaced"):
-                if bool_key in polaris_stats:
-                    polaris_stats[bool_key] = 1.0 if polaris_stats[bool_key] else 0.0
 
             # Optionally skip this batch to align with verl when insufficient good samples
             if (
@@ -323,8 +320,6 @@ def log_polaris_stats(rollout_id, args, polaris_stats):
                 f"Missing POLARIS stats: expected {expected_controller_count} controller reports, "
                 f"got {rank_count}. This may indicate a crash, early exit, or communication issue in one or more ranks."
             )
-
-            rank_count = len(valid_stats)
 
             averaged_stats = {}
             all_keys = set().union(*(s.keys() for s in valid_stats))
