@@ -694,6 +694,7 @@ def policy_loss_function(
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
         ois = (-ppo_kl).exp()
+<<<<<<< HEAD
         tis_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
@@ -703,6 +704,10 @@ def policy_loss_function(
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
         }
+=======
+        tis_clip = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
+        tis_clipfrac = (tis_clip != tis).float()
+>>>>>>> b914ff6 (tis_clipfrac type conversion)
 
         if args.custom_tis_function_path is not None:
             tis_func = load_function(args.custom_tis_function_path)
