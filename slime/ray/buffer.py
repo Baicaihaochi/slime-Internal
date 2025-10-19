@@ -121,14 +121,50 @@ class RolloutController:
         assert len(raw_rewards) == len(samples)
         assert len(rewards) == len(samples)
 
-        dataset_indices: list[int | None] = []
-        for sample in samples:
+        filtered_samples: list[Sample] = []
+        filtered_raw_rewards: list[float] = []
+        filtered_rewards: list[float] = []
+        filtered_dataset_indices: list[int | None] = []
+        dropped = 0
+
+        for sample, raw_reward, reward in zip(samples, raw_rewards, rewards):
+            response_len = int(sample.response_length)
+
+            if response_len <= 0:
+                dropped += 1
+                continue
+
+            if sample.loss_mask is None:
+                sample.loss_mask = [1] * response_len
+
+            if len(sample.loss_mask) != response_len:
+                if len(sample.loss_mask) > response_len and response_len > 0:
+                    sample.loss_mask = sample.loss_mask[:response_len]
+                else:
+                    dropped += 1
+                    continue
+
             idx = None
             if sample.metadata and isinstance(sample.metadata, dict):
                 value = sample.metadata.get("dataset_index")
                 if isinstance(value, int):
                     idx = value
-            dataset_indices.append(idx)
+
+            filtered_samples.append(sample)
+            filtered_raw_rewards.append(raw_reward)
+            filtered_rewards.append(reward)
+            filtered_dataset_indices.append(idx)
+
+        if dropped > 0:
+            print(f"[RolloutController] Dropped {dropped} invalid samples (response_length<=0 or mismatched loss_mask).")
+
+        if not filtered_samples:
+            raise RuntimeError("No valid samples remained after filtering invalid rollout entries.")
+
+        samples = filtered_samples
+        raw_rewards = filtered_raw_rewards
+        rewards = filtered_rewards
+        dataset_indices = filtered_dataset_indices
 
         train_data = {
             "tokens": [sample.tokens for sample in samples],

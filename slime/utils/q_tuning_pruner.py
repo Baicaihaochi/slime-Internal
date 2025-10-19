@@ -8,10 +8,12 @@ categorizes training data into four quadrants using perplexity (error) and entro
 Reference: https://arxiv.org/abs/2509.23873
 """
 
+import math
+from typing import Dict, List, Tuple, Optional
+
+import numpy as np
 import torch
 import torch.nn.functional as F
-from typing import Dict, List, Tuple, Optional
-import numpy as np
 
 from slime.utils.ppo_utils import calculate_log_probs_and_entropy
 
@@ -175,8 +177,8 @@ class QTuningPruner:
                     with_entropy=True,
                 )
 
-                log_probs_tensor = log_probs_tensor.squeeze(-1)
-                entropy_tensor = entropy_tensor.squeeze(-1)
+                log_probs_tensor = torch.atleast_1d(log_probs_tensor.squeeze(-1))
+                entropy_tensor = torch.atleast_1d(entropy_tensor.squeeze(-1))
                 token_nlls = -log_probs_tensor
 
                 # Clamp to avoid numerical issues
@@ -374,46 +376,86 @@ class QTuningPruner:
         Returns:
             Loss mask tensor for response tokens only (length = response_len).
         """
+        response_tokens = tokens[response_start_idx:]
+        response_len = response_tokens.size(0)
+
+        if len(token_ppls) == 0 or response_len == 0:
+            if base_loss_mask is not None:
+                if isinstance(base_loss_mask, torch.Tensor):
+                    base_mask = base_loss_mask.clone().detach()
+                else:
+                    base_mask = torch.tensor(base_loss_mask, dtype=torch.long, device=tokens.device)
+                if base_mask.size(0) == tokens.size(0):
+                    base_mask = base_mask[response_start_idx: response_start_idx + response_len]
+                return base_mask.to(device=tokens.device, dtype=torch.long)
+            return torch.zeros(response_len, dtype=torch.long, device=tokens.device)
+
         scores = self.neighbor_aware_token_scoring(token_ppls)
 
-        num_keep = max(1, int(len(scores) * self.token_keep_ratio))
+        num_keep = len(scores)
+        if self.token_keep_ratio < 1.0:
+            # keep highest priority tokens (lowest score)
+            num_keep = max(1, math.ceil(len(scores) * self.token_keep_ratio))
         sorted_indices = np.argsort(scores)[:num_keep]
         sorted_indices = np.sort(sorted_indices)
 
-        response_tokens = tokens[response_start_idx:]
-
-        response_len = response_tokens.size(0)
         if base_loss_mask is not None:
-            base_mask = base_loss_mask.detach()
-            if base_mask.dim() != 1:
-                raise ValueError(f"Expected 1D loss mask, got shape {base_mask.shape}")
-            if base_mask.size(0) not in (response_len, tokens.size(0)):
-                raise ValueError(
-                    f"Loss mask length {base_mask.size(0)} incompatible with response length {response_len}"
-                )
-            if base_mask.size(0) == tokens.size(0):
-                base_mask = base_mask[response_start_idx:]
-            base_mask = base_mask.to(torch.long)
+            if isinstance(base_loss_mask, torch.Tensor):
+                base_mask = base_loss_mask.clone().detach()
+            else:
+                base_mask = torch.tensor(base_loss_mask, dtype=torch.long, device=tokens.device)
         else:
             base_mask = torch.ones(response_len, dtype=torch.long, device=tokens.device)
 
-        kept_indices = torch.from_numpy(sorted_indices).long()
-        if kept_indices.numel() == response_len:
+        if base_mask.dim() != 1:
+            raise ValueError(f"Expected 1D loss mask, got shape {base_mask.shape}")
+
+        if base_mask.size(0) not in (response_len, tokens.size(0)):
+            raise ValueError(
+                f"Loss mask length {base_mask.size(0)} incompatible with response length {response_len}"
+            )
+
+        if base_mask.size(0) == tokens.size(0):
+            # convert full-length mask to response-only mask
+            base_mask = base_mask[response_start_idx: response_start_idx + response_len]
+        else:
+            base_mask = base_mask.to(device=tokens.device, dtype=torch.long)
+
+        kept_indices_tensor = torch.from_numpy(sorted_indices).long().to(base_mask.device)
+        if kept_indices_tensor.numel() == response_len:
             new_mask = base_mask.clone()
         else:
             new_mask = torch.zeros_like(base_mask)
-            kept_indices_device = kept_indices.to(new_mask.device)
-            new_mask[kept_indices_device] = base_mask[kept_indices_device]
+            new_mask[kept_indices_tensor] = base_mask[kept_indices_tensor]
 
         if new_mask.sum() == 0:
-            print(
-                "[Q-Tuning Warning] All tokens masked out; forcing one token to remain for stability."
-            )
-            first_idx = kept_indices[0].item() if kept_indices.numel() > 0 else 0
-            first_idx = int(min(max(first_idx, 0), response_len - 1))
-            new_mask[first_idx] = 1
+            print("[Q-Tuning Warning] All tokens masked out; forcing one token to remain for stability.")
+            fallback_idx = int(kept_indices_tensor[0].item()) if kept_indices_tensor.numel() > 0 else 0
+            fallback_idx = max(0, min(fallback_idx, response_len - 1))
+            new_mask[fallback_idx] = 1
 
-        return new_mask.to(tokens.device)
+        return new_mask.to(device=tokens.device, dtype=torch.long)
+
+    @staticmethod
+    def _normalize_values(values: List[float]) -> List[float]:
+        arr = np.array(values, dtype=np.float32)
+        if arr.size == 0:
+            return []
+        v_min = float(arr.min())
+        v_max = float(arr.max())
+        if abs(v_max - v_min) < 1e-6:
+            return [0.5 for _ in values]
+        return [float((v - v_min) / (v_max - v_min)) for v in values]
+
+    def _target_keep_count(self, total: int) -> int:
+        if total == 0:
+            return 0
+        if self.sample_keep_ratio <= 0.0:
+            return 0
+        if self.sample_keep_ratio >= 1.0:
+            return total
+        keep = math.ceil(self.sample_keep_ratio * total)
+        return max(1, min(total, keep))
 
     def prune_batch(
         self,
@@ -437,8 +479,12 @@ class QTuningPruner:
         loss_masks_list = rollout_data.get("loss_masks")
         total_lengths_list = rollout_data.get("total_lengths")
 
+        num_samples = len(tokens_list)
+        if num_samples == 0:
+            return None
+
         # Stage 1: Compute PPL and Entropy for all samples
-        sample_metrics = []
+        sample_metrics: List[Dict] = []
         for idx, (tokens, resp_len) in enumerate(zip(tokens_list, response_lengths)):
             prompt_len = len(tokens) - resp_len
             ppl, ent, token_ppls, token_ents = self.compute_ppl_and_entropy(
@@ -461,8 +507,11 @@ class QTuningPruner:
         entropies = [m["entropy"] for m in sample_metrics]
         ppl_low, ppl_high, ent_low, ent_high = self.bisect_search_thresholds(ppls, entropies)
 
+        norm_ppls = self._normalize_values(ppls)
+        norm_ents = self._normalize_values(entropies)
+
         # Stage 2: Classify and prune
-        kept_indices = []
+        kept_indices: List[int] = []
         pruned_tokens_list = []
         pruned_loss_masks = []
         quadrant_counts = {"Q1": 0, "Q2": 0, "Q3": 0, "Q4": 0}
@@ -473,33 +522,88 @@ class QTuningPruner:
                 ppl_low, ppl_high, ent_low, ent_high
             )
             quadrant_counts[quadrant] += 1
+            metrics["quadrant"] = quadrant
+            metrics["norm_ppl"] = norm_ppls[idx]
+            metrics["norm_entropy"] = norm_ents[idx]
+            metrics["support_score"] = abs(norm_ppls[idx] - norm_ents[idx])
+            if quadrant == "Q2":
+                metrics["keep_priority"] = norm_ppls[idx] - norm_ents[idx]
+            elif quadrant == "Q4":
+                metrics["keep_priority"] = norm_ents[idx] - norm_ppls[idx]
+            else:
+                metrics["keep_priority"] = -metrics["support_score"]
 
-            # Keep Q2 and Q4 samples
-            if quadrant in ["Q2", "Q4"]:
-                kept_indices.append(idx)
+        target_keep = self._target_keep_count(num_samples)
+        if target_keep == 0:
+            print("[Q-Tuning] Sample keep ratio requested 0; skipping batch.")
+            return None
 
-                tokens = metrics["tokens"]
-                base_loss_mask = metrics["loss_mask"]
-                response_start_idx = metrics["response_start_idx"]
+        primary_indices = [i for i, m in enumerate(sample_metrics) if m["quadrant"] in {"Q2", "Q4"}]
+        primary_sorted = sorted(primary_indices, key=lambda i: sample_metrics[i]["keep_priority"], reverse=True)
+        kept_indices = primary_sorted[:target_keep]
 
-                if quadrant == "Q2":
-                    loss_mask = self.prune_tokens(
-                        tokens,
-                        metrics["token_ppls"],
-                        response_start_idx,
-                        base_loss_mask=base_loss_mask,
-                    )
-                else:
-                    if base_loss_mask is not None:
-                        # base_loss_mask should already be response-only
-                        loss_mask = base_loss_mask.clone()
+        if len(kept_indices) < target_keep:
+            fallback_candidates = [
+                i for i, m in enumerate(sample_metrics)
+                if m["quadrant"] in {"Q1", "Q3"} and i not in kept_indices
+            ]
+            fallback_sorted = sorted(fallback_candidates, key=lambda i: sample_metrics[i]["support_score"], reverse=True)
+            for cand in fallback_sorted:
+                if len(kept_indices) >= target_keep:
+                    break
+                kept_indices.append(cand)
+
+        if len(kept_indices) < target_keep:
+            # as a last resort, add remaining samples by descending support
+            remaining = [
+                i for i in range(num_samples)
+                if i not in kept_indices
+            ]
+            remaining_sorted = sorted(remaining, key=lambda i: sample_metrics[i]["support_score"], reverse=True)
+            for cand in remaining_sorted:
+                if len(kept_indices) >= target_keep:
+                    break
+                kept_indices.append(cand)
+
+        if not kept_indices:
+            print("[Q-Tuning] No samples selected after pruning; keeping the best scoring sample to avoid stall.")
+            fallback_idx = int(np.argmax([m["support_score"] for m in sample_metrics]))
+            kept_indices = [fallback_idx]
+
+        # Ensure deterministic order
+        kept_indices = sorted(kept_indices)
+
+        for idx in kept_indices:
+            metrics = sample_metrics[idx]
+            quadrant = metrics["quadrant"]
+            tokens = metrics["tokens"]
+            base_loss_mask = metrics["loss_mask"]
+            response_start_idx = metrics["response_start_idx"]
+
+            if quadrant == "Q2":
+                loss_mask = self.prune_tokens(
+                    tokens,
+                    metrics["token_ppls"],
+                    response_start_idx,
+                    base_loss_mask=base_loss_mask,
+                )
+            else:
+                response_length = len(tokens) - response_start_idx
+                if base_loss_mask is not None:
+                    if isinstance(base_loss_mask, torch.Tensor):
+                        loss_mask = base_loss_mask.clone().detach()
                     else:
-                        # Create response-only mask (all 1s)
-                        response_length = len(tokens) - response_start_idx
-                        loss_mask = torch.ones(response_length, dtype=torch.long, device=tokens.device)
+                        loss_mask = torch.tensor(base_loss_mask, dtype=torch.long, device=tokens.device)
+                    if loss_mask.dim() != 1:
+                        raise ValueError(f"Expected 1D loss mask, got shape {loss_mask.shape}")
+                    if loss_mask.size(0) == tokens.size(0):
+                        loss_mask = loss_mask[response_start_idx: response_start_idx + response_length]
+                    loss_mask = loss_mask.to(device=tokens.device, dtype=torch.long)
+                else:
+                    loss_mask = torch.ones(response_length, dtype=torch.long, device=tokens.device)
 
-                pruned_tokens_list.append(tokens)
-                pruned_loss_masks.append(loss_mask)
+            pruned_tokens_list.append(tokens)
+            pruned_loss_masks.append(loss_mask)
 
         # Build pruned rollout_data
         pruned_rollout_data = {}
@@ -523,6 +627,9 @@ class QTuningPruner:
 
         if "total_lengths" in pruned_rollout_data:
             pruned_rollout_data["total_lengths"] = [sample_metrics[i]["total_length"] for i in kept_indices]
+
+        quadrant_id_map = {"Q1": 1, "Q2": 2, "Q3": 3, "Q4": 4}
+        pruned_rollout_data["q_tuning_quadrant"] = [quadrant_id_map[sample_metrics[i]["quadrant"]] for i in kept_indices]
 
         # Log statistics
         print(f"[Q-Tuning] Quadrant distribution: {quadrant_counts}")
