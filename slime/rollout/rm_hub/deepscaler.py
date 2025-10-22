@@ -7,7 +7,7 @@ def get_deepscaler_rule_based_reward(response, label, args=None, sample=None, ev
     elif "###Response" in response:
         model_solution = response.split("###Response")[1]
     else:
-        return 0
+        model_solution = response
 
     model_answer = extract_answer(model_solution)
     if model_answer is None:
