@@ -4,6 +4,10 @@ import os
 from typing import Any, Dict
 
 import yaml
+<<<<<<< HEAD
+=======
+
+>>>>>>> 2e08677 (MIS Integration)
 from transformers import AutoConfig
 
 from slime.backends.sglang_utils.arguments import add_sglang_arguments
@@ -788,6 +792,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Path to the custom TIS function.",
             )
+<<<<<<< HEAD
 
             parser.add_argument(
                 "--use-routing-replay",
@@ -809,6 +814,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 nargs="+",
                 default="",
             )
+=======
+>>>>>>> 2e08677 (MIS Integration)
             return parser
 
         # wandb
@@ -1605,10 +1612,14 @@ def slime_validate_args(args):
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
 
+<<<<<<< HEAD
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     if args.custom_config_path:
+=======
+    if getattr(args, "custom_config_path", None):
+>>>>>>> 2e08677 (MIS Integration)
         with open(args.custom_config_path, "r") as f:
             data = yaml.safe_load(f) or {}
         for k, v in data.items():

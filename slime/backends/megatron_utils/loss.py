@@ -665,6 +665,7 @@ def policy_loss_function(
 
     pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
+<<<<<<< HEAD
     # Apply off-policy correction using importance sampling if enabled
     if args.use_tis:
 
@@ -698,21 +699,54 @@ def policy_loss_function(
         tis_kwargs = {
             "args": args,
             "pg_loss": pg_loss,
+=======
+    # Apply TIS off-policy correction using importance sampling if enabled
+    tis_metrics = {}
+    if args.use_tis:
+
+        def vanilla_tis_function(
+            args,
+            *,
+            train_log_probs,
+            rollout_log_probs,
+            **kwargs,
+        ):
+            rollout_log_probs = torch.cat(rollout_log_probs, dim=0)
+            old_log_probs = torch.cat(train_log_probs, dim=0)
+            tis = torch.exp(old_log_probs - rollout_log_probs)
+            tis_weights = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
+            tis_clipfrac = (tis_weights != tis).float()
+            metrics = {
+                "tis": tis.clone().detach(),
+                "tis_clipfrac": tis_clipfrac.clone().detach(),
+            }
+            return tis_weights, metrics
+
+        assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
+
+        ois = (-ppo_kl).exp()
+        tis_kwargs = {
+            "args": args,
+>>>>>>> 2e08677 (MIS Integration)
             "train_log_probs": batch["log_probs"],
             "rollout_log_probs": batch["rollout_log_probs"],
             "loss_masks": batch["loss_masks"],
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
         }
+<<<<<<< HEAD
 =======
         tis_clip = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
         tis_clipfrac = (tis_clip != tis).float()
 >>>>>>> b914ff6 (tis_clipfrac type conversion)
+=======
+>>>>>>> 2e08677 (MIS Integration)
 
         if args.custom_tis_function_path is not None:
             tis_func = load_function(args.custom_tis_function_path)
         else:
             tis_func = vanilla_tis_function
+<<<<<<< HEAD
         pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
 
         # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
@@ -720,6 +754,11 @@ def policy_loss_function(
         sum_of_sample_mean = get_sum_of_sample_mean(
             total_lengths, response_lengths, modified_response_masks, args.calculate_per_token_loss
         )
+=======
+        tis_weights, tis_metrics = tis_func(**tis_kwargs)
+
+        pg_loss = pg_loss * tis_weights
+>>>>>>> 2e08677 (MIS Integration)
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -769,10 +808,15 @@ def policy_loss_function(
 
     if args.use_tis:
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
+<<<<<<< HEAD
         # Assume all metrics are already cloned and detached
         for metric_key, metric_value in tis_metrics.items():
             key_name = f"{metric_key}"
             reported_loss[key_name] = sum_of_sample_mean(metric_value)
+=======
+        for metric_key, metric_value in tis_metrics.items():
+            reported_loss[metric_key] = sum_of_sample_mean(metric_value).clone().detach()
+>>>>>>> 2e08677 (MIS Integration)
 
     return loss, reported_loss
 
