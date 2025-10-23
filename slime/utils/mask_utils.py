@@ -105,7 +105,10 @@ class MultiTurnLossMaskGenerator:
         response_length = len(response_tokens)
         token_ids = prompt_tokens + response_tokens
         loss_mask = [0] * len(prompt_tokens) + [1] * response_length
+<<<<<<< HEAD
 
+=======
+>>>>>>> bf1d677 (add CISPO loss & rm q tuning)
         if messages[-1].get("step_loss_mask", 1) != 1:
             loss_mask = [0] * len(token_ids)
         return token_ids, loss_mask

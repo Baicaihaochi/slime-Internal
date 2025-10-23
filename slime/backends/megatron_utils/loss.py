@@ -99,19 +99,19 @@ def get_responses(
                 "token_stats": token_stats,
             }
 
-            path = f"/tmp/q_tuning_bad_logits_rank{rank}_sample{sample_idx}_{prefix.replace(' ', '_')}.pt"
+            path = f"/tmp/stability_bad_logits_rank{rank}_sample{sample_idx}_{prefix.replace(' ', '_')}.pt"
             payload["tensor"] = tensor_cpu
             if tokens is not None:
                 payload["tokens"] = tokens.detach().cpu()
             torch.save(payload, path)
             print(
-                f"[Q-Tuning Debug] Saved non-finite tensor snapshot to {path} "
+                f"[Training Stability Debug] Saved non-finite tensor snapshot to {path} "
                 f"(prefix={prefix}, num_bad={num_bad}, first_bad_position={first_pos}, max_abs={max_abs})",
                 flush=True,
             )
         except Exception as exc:  # pragma: no cover - best-effort debug aid
             print(
-                f"[Q-Tuning Debug] Failed to dump non-finite tensor (prefix={prefix}, sample_idx={sample_idx}): {exc}",
+                f"[Training Stability Debug] Failed to dump non-finite tensor (prefix={prefix}, sample_idx={sample_idx}): {exc}",
                 flush=True,
             )
 
@@ -164,7 +164,7 @@ def get_responses(
             token_min_val = tokens_chunk.min().item()
             if token_max_val >= global_vocab_upper_bound or token_min_val < 0:
                 print(
-                    "[Q-Tuning] Token index out of bounds detected "
+                    "[Training Stability] Token index out of bounds detected "
                     f"(sample_idx={sample_idx}, global_vocab_upper_bound={global_vocab_upper_bound}, "
                     f"token_min={token_min_val}, token_max={token_max_val}, "
                     f"total_length={total_length}, response_length={response_length})"
@@ -244,7 +244,7 @@ def get_responses(
                 token_min = torch.stack(token_min_candidates).min().item()
                 if token_max >= global_vocab_upper_bound or token_min < 0:
                     print(
-                        "[Q-Tuning] Token index out of bounds detected (CP path) "
+                        "[Training Stability] Token index out of bounds detected (CP path) "
                         f"(sample_idx={sample_idx}, global_vocab_upper_bound={global_vocab_upper_bound}, "
                         f"token_min={token_min}, token_max={token_max}, "
                         f"total_length={total_length}, response_length={response_length})"
@@ -564,7 +564,10 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
+<<<<<<< HEAD
     old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
+=======
+>>>>>>> bf1d677 (add CISPO loss & rm q tuning)
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -640,6 +643,7 @@ def policy_loss_function(
                 total_lengths, response_lengths, batch["loss_masks"], args.calculate_per_token_loss
             )
 
+    old_log_probs_flat: torch.Tensor | None = None
     if args.advantage_estimator == "gspo":
         full_log_probs = [
             all_gather_with_cp(log_prob, total_length, response_length)
@@ -658,12 +662,38 @@ def policy_loss_function(
         ppo_kl = [kl.expand_as(log_prob) for kl, log_prob in zip(ppo_kl, log_probs)]
         ppo_kl = torch.cat(ppo_kl, dim=0)
         log_probs = torch.cat(log_probs, dim=0)
+        old_log_probs_flat = torch.cat(full_old_log_probs, dim=0)
     else:
+<<<<<<< HEAD
         old_log_probs = torch.cat(old_log_probs, dim=0)
+=======
+        old_log_probs_flat = torch.cat(batch["log_probs"], dim=0)
+>>>>>>> bf1d677 (add CISPO loss & rm q tuning)
         log_probs = torch.cat(log_probs, dim=0)
-        ppo_kl = old_log_probs - log_probs
+        ppo_kl = old_log_probs_flat - log_probs
 
-    pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
+    cispo_stats: dict[str, torch.Tensor] | None = None
+    is_cispo = getattr(args, "policy_objective", "ppo") == "cispo"
+
+    if is_cispo:
+        assert old_log_probs_flat is not None, "old log probs must be available for CISPO."
+        ratio = torch.exp(log_probs - old_log_probs_flat)
+        ratio_clipped = ratio
+        eps_low = getattr(args, "cispo_eps_low", 0.0)
+        eps_high = getattr(args, "cispo_eps_high", 2.0)
+        if eps_low is not None and eps_low > 0.0:
+            ratio_clipped = ratio_clipped.clamp_min(1.0 - eps_low)
+        if eps_high is not None and eps_high > 0.0:
+            ratio_clipped = ratio_clipped.clamp_max(1.0 + eps_high)
+        clip_mask = (ratio_clipped != ratio).float()
+        pg_loss = -(ratio_clipped.detach() * advantages) * log_probs
+        pg_clipfrac = clip_mask
+        cispo_stats = {
+            "ratio_mean": sum_of_sample_mean(ratio_clipped.detach()),
+            "ratio_max": ratio.detach().max(),
+        }
+    else:
+        pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
 <<<<<<< HEAD
     # Apply off-policy correction using importance sampling if enabled
@@ -764,6 +794,9 @@ def policy_loss_function(
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
     ppo_kl = sum_of_sample_mean(ppo_kl)
 
+    if cispo_stats is not None:
+        cispo_stats["clipfrac"] = pg_clipfrac.clone().detach()
+
     # entropy loss
     entropy = log_probs_and_entropy["entropy"]
     entropy = torch.cat(entropy, dim=0)
@@ -817,6 +850,11 @@ def policy_loss_function(
         for metric_key, metric_value in tis_metrics.items():
             reported_loss[metric_key] = sum_of_sample_mean(metric_value).clone().detach()
 >>>>>>> 2e08677 (MIS Integration)
+
+    if cispo_stats is not None:
+        reported_loss["cispo_ratio_mean"] = cispo_stats["ratio_mean"].clone().detach()
+        reported_loss["cispo_ratio_max"] = cispo_stats["ratio_max"].clone().detach()
+        reported_loss["cispo_clipfrac"] = cispo_stats["clipfrac"].clone().detach()
 
     return loss, reported_loss
 
@@ -953,7 +991,7 @@ def sft_loss_function(
             else None
         )
         print(
-            "[Q-Tuning] Non-finite loss detected. "
+            "[Training Stability] Non-finite loss detected. "
             f"loss={loss}, "
             f"num_log_probs={log_probs.numel()}, "
             f"loss_mask_sums={loss_mask_sums}, "
