@@ -540,6 +540,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--policy-objective",
+                type=str,
+                choices=["ppo", "cispo"],
+                default="ppo",
+                help="Policy gradient objective. PPO applies token clipping; CISPO clips importance weights.",
+            )
+            parser.add_argument(
                 "--custom-loss-function-path",
                 type=str,
                 default=None,
@@ -602,6 +609,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "Default 0.2 means only the top 20%% highest-entropy tokens will receive gradients. "
                     "According to the paper, 20%% achieves optimal balance between exploration and performance."
                 ),
+            )
+            parser.add_argument(
+                "--cispo-eps-high",
+                type=float,
+                default=2.0,
+                help="Upper bound ε_high for CISPO importance-weight clipping (ratio limited to 1 + ε_high).",
+            )
+            parser.add_argument(
+                "--cispo-eps-low",
+                type=float,
+                default=0.0,
+                help="Lower bound ε_low for CISPO importance-weight clipping (set ≤0 to disable the lower clamp).",
             )
             parser.add_argument(
                 "--disable-grpo-std-normalization",
@@ -881,56 +900,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--loss-mask-type",
                 type=str,
                 default="qwen",
-                choices=["qwen", "distill_qwen"],
+                choices=["qwen", "qwen3", "distill_qwen"],
                 help="Loss mask type",
-            )
-            return parser
-
-        def add_q_tuning_arguments(parser):
-            """
-            Add Q-Tuning dynamic data pruning arguments.
-            Q-Tuning implements joint sample and token pruning based on the Error-Uncertainty (EU) Plane.
-            Reference: "Winning the Pruning Gamble" (arXiv:2509.23873)
-            """
-            parser.add_argument(
-                "--enable-q-tuning",
-                action="store_true",
-                default=False,
-                help="Enable Q-Tuning dynamic data pruning based on PPL and Entropy",
-            )
-            parser.add_argument(
-                "--q-tuning-sample-keep-ratio",
-                type=float,
-                default=0.5,
-                help=(
-                    "Target ratio of samples to keep after stage 1 (sample-level pruning). "
-                    "The bisection search will find thresholds to achieve this ratio."
-                ),
-            )
-            parser.add_argument(
-                "--q-tuning-token-keep-ratio",
-                type=float,
-                default=0.7,
-                help=(
-                    "Ratio of tokens to keep for Q2 samples in stage 2 (token-level pruning). "
-                    "Q4 samples are kept in full."
-                ),
-            )
-            parser.add_argument(
-                "--q-tuning-neighbor-lambda",
-                type=float,
-                default=0.5,
-                help=(
-                    "Smoothing coefficient for neighbor-aware token scoring. "
-                    "score_i = (1-λ)*PPL_i + λ*(PPL_{i-1}+PPL_{i+1})/2. "
-                    "Range: [0, 1], where 0 means no neighbor smoothing."
-                ),
-            )
-            parser.add_argument(
-                "--q-tuning-bisect-max-iter",
-                type=int,
-                default=10,
-                help="Maximum iterations for bisection search to find optimal thresholds",
             )
             return parser
 
@@ -1050,7 +1021,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
-        parser = add_q_tuning_arguments(parser)
         parser = add_polaris_arguments(parser)
         parser = add_ci_arguments(parser)
 

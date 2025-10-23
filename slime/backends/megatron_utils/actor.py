@@ -109,9 +109,6 @@ class MegatronTrainRayActor(TrainRayActor):
             )
             self.prof.start()
 
-        # Q-Tuning reservoir to accumulate pruned samples until we can form full microbatches
-        self._q_tuning_sample_pool: dict | None = None
-
         # POLARIS components initialization
         self.reward_tracker, self.dynamic_replacer = init_polaris_components(args)
 
@@ -202,51 +199,6 @@ class MegatronTrainRayActor(TrainRayActor):
             ]
         return rollout_data
 
-    def _q_tuning_prepare_batch(self, pruned_rollout_data: dict | None) -> dict | None:
-        if pruned_rollout_data is None:
-            return None
-
-        required_per_rank = self.args.global_batch_size // mpu.get_data_parallel_world_size(with_context_parallel=False)
-        if required_per_rank == 0:
-            return pruned_rollout_data
-
-        if self._q_tuning_sample_pool is None:
-            self._q_tuning_sample_pool = {}
-
-        pool = self._q_tuning_sample_pool
-
-        for key, val in pruned_rollout_data.items():
-            if isinstance(val, list):
-                if key not in pool:
-                    pool[key] = []
-                pool[key].extend(val)
-            else:
-                if key not in pool:
-                    pool[key] = val
-                else:
-                    pool[key] = val
-
-        total_buffered = len(pool.get("tokens", []))
-        if total_buffered < required_per_rank:
-            return None
-
-        ready_count = (total_buffered // required_per_rank) * required_per_rank
-        if ready_count == 0:
-            return None
-
-        ready_batch: dict = {}
-        for key in list(pool.keys()):
-            val = pool[key]
-            if isinstance(val, list):
-                selected = val[:ready_count]
-                ready_batch[key] = selected
-                remaining = val[ready_count:]
-                pool[key] = remaining
-            else:
-                ready_batch[key] = val
-
-        return ready_batch
-
     def compute_log_prob(
         self,
         model_tag,
@@ -284,7 +236,7 @@ class MegatronTrainRayActor(TrainRayActor):
                 rollout_data = self._get_rollout_data(rollout_data_ref)
 
                 # POLARIS: Apply dynamic sampling and reward tracking
-                # This should be done BEFORE Q-Tuning and compute_advantages_and_returns
+                # This should be done before computing advantages_and_returns
                 polaris_stats = {}
                 if self.args.enable_polaris_dynamic_sampling or self.args.enable_polaris_reward_tracking:
                     with timer("polaris_processing"):
@@ -301,25 +253,6 @@ class MegatronTrainRayActor(TrainRayActor):
                             print("[POLARIS] Skip this batch due to insufficient medium-difficulty samples.")
                             Timer().start("train_wait")
                             return
-
-                # Q-Tuning: Dynamic data pruning based on PPL and Entropy
-                if self.args.enable_q_tuning:
-                    with timer("q_tuning_pruning"):
-                        from slime.utils.q_tuning_pruner import QTuningPruner
-
-                        pruner = QTuningPruner(
-                            sample_keep_ratio=self.args.q_tuning_sample_keep_ratio,
-                            token_keep_ratio=self.args.q_tuning_token_keep_ratio,
-                            neighbor_lambda=self.args.q_tuning_neighbor_lambda,
-                            bisect_max_iter=self.args.q_tuning_bisect_max_iter,
-                        )
-                        pruned_data = pruner.prune_batch(self.model, rollout_data)
-
-                    rollout_data = self._q_tuning_prepare_batch(pruned_data)
-                    if rollout_data is None:
-                        print("[Q-Tuning] Accumulating samples; insufficient data for a full microbatch.")
-                        Timer().start("train_wait")
-                        return
 
                 # Create data iterator for log_probs and train.
                 data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
