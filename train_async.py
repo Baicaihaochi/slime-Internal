@@ -28,7 +28,7 @@ def train(args):
     # sync the initialization (model initalization, load checkpoint, etc.)
     # Note that we initialize it earlier as megatron ckpt loading may have really large peak memory usage.
     start_rollout_ids = ray.get(
-        actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss)
+        actor_model.async_init(args, role="actor", with_ref=args.kl_coef != 0 or args.use_kl_loss or args.enable_on_policy_distill,)
     )
     assert len(set(start_rollout_ids)) == 1
     if args.start_rollout_id is None:

@@ -177,15 +177,27 @@ class RolloutController:
                 raise RuntimeError(
                     f"Filtered rollout batch ({valid_len} samples) smaller than global batch size {global_bs}."
                 )
-            if trimmed_len != valid_len:
-                drop_tail = valid_len - trimmed_len
-                print(
-                    f"[RolloutController] Trimmed {drop_tail} samples to keep batch size divisible by global_batch_size ({global_bs})."
+        if trimmed_len != valid_len:
+            drop_tail = valid_len - trimmed_len
+            print(
+                f"[RolloutController] Trimmed {drop_tail} samples to keep batch size divisible by global_batch_size ({global_bs})."
+            )
+            samples = samples[:trimmed_len]
+            raw_rewards = raw_rewards[:trimmed_len]
+            rewards = rewards[:trimmed_len]
+            dataset_indices = dataset_indices[:trimmed_len]
+
+        if self.args.enable_on_policy_distill:
+            missing_teacher_positions = [idx for idx, sample in enumerate(samples) if sample.teacher_log_probs is None]
+            if missing_teacher_positions:
+                preview = ", ".join(map(str, missing_teacher_positions[:5]))
+                if len(missing_teacher_positions) > 5:
+                    preview += ", ..."
+                raise RuntimeError(
+                    "On-policy distillation requires teacher log probabilities for every sample, "
+                    f"but none were recorded at batch positions: {preview}. "
+                    "Ensure the teacher service is reachable."
                 )
-                samples = samples[:trimmed_len]
-                raw_rewards = raw_rewards[:trimmed_len]
-                rewards = rewards[:trimmed_len]
-                dataset_indices = dataset_indices[:trimmed_len]
 
         train_data = {
             "tokens": [sample.tokens for sample in samples],
@@ -224,6 +236,20 @@ class RolloutController:
         # Add rollout log probabilities for off-policy correction
         if samples[0].rollout_log_probs is not None:
             train_data["rollout_log_probs"] = [sample.rollout_log_probs for sample in samples]
+
+        if samples[0].teacher_log_probs is not None:
+            teacher_log_probs = []
+            for sample in samples:
+                if sample.teacher_log_probs is None:
+                    raise RuntimeError(
+                        "Missing teacher log probabilities for sample while distillation is enabled."
+                    )
+                if len(sample.teacher_log_probs) != sample.response_length:
+                    raise RuntimeError(
+                        "Teacher log probabilities length mismatch with response length."
+                    )
+                teacher_log_probs.append(sample.teacher_log_probs)
+            train_data["teacher_log_probs"] = teacher_log_probs
 
         if samples[0].train_metadata is not None:
             train_data["metadata"] = [sample.train_metadata for sample in samples]
