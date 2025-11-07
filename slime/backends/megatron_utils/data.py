@@ -322,14 +322,27 @@ def log_rollout_data(rollout_id: int, args: Namespace, rollout_data: RolloutBatc
             # - Each dp rank has the same number of samples
             if isinstance(val, (list, tuple)):
                 if isinstance(val[0], torch.Tensor):
+<<<<<<< HEAD
                     # NOTE: Here we have to do the clone().detach(), otherwise the tensor will be
                     # modified in place and will cause problem for the next rollout.
                     val = torch.cat(val).clone().detach()
                     if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages", "values"]:
+=======
+                    tensor_val = torch.cat(val).clone().detach()
+                    if key in ["log_probs", "ref_log_probs", "rollout_log_probs", "returns", "advantages"]:
+>>>>>>> c270d0b (clean)
                         sum_of_sample_mean = get_sum_of_sample_mean(total_lengths, response_lengths, loss_masks)
-                        val = cp_size * sum_of_sample_mean(val) / len(loss_masks)
+                        per_sample_mean = sum_of_sample_mean(tensor_val) / len(loss_masks)
+                        log_dict.setdefault("student_logp", None)
+                        log_dict.setdefault("teacher_logp", None)
+                        if key == "log_probs":
+                            log_dict["student_logp"] = per_sample_mean.detach().float().item()
+                        if key == "ref_log_probs":
+                            log_dict["teacher_logp"] = per_sample_mean.detach().float().item()
+                        tensor_val = cp_size * sum_of_sample_mean(tensor_val)
                     else:
-                        val = val.mean() * cp_size
+                        tensor_val = tensor_val.mean() * cp_size
+                    val = tensor_val
                 else:
                     val = sum(val) / len(val)
             elif isinstance(val, torch.Tensor):

@@ -251,6 +251,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--distill-teacher-url",
+                type=str,
+                default=None,
+                help=(
+                    "HTTP endpoint for an external teacher server that returns per-token log probabilities. "
+                    "The server is expected to accept JSON payloads with prompt and completion tokens and return "
+                    "a list of log probabilities for the completion tokens. If unset, on-policy distillation will "
+                    "not query an external teacher."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-shuffle",
                 action="store_true",
                 default=False,
@@ -690,9 +701,42 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Choose KL loss type: kl, k2, k3, low_var_kl",
             )
             parser.add_argument(
+                "--enable-on-policy-distill",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable on-policy distillation. Requires a teacher checkpoint via --ref-load. "
+                    "When set, the student advantages will be computed from the reverse KL between "
+                    "teacher and student log probabilities."
+                ),
+            )
+            parser.add_argument(
+                "--use-is-distill-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Switch the on-policy distillation objective to the importance-sampling style loss used in "
+                    "Tinker Cookbook. When enabled, advantages are built as reward advantages minus KL penalty "
+                    "and applied directly to current log probabilities."
+                ),
+            )
+            parser.add_argument(
+                "--kl-penalty-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for the token-level KL penalty term used by the importance-sampling distillation loss. "
+                    "Effective only when --use-is-distill-loss is supplied."
+                ),
+            )
+            parser.add_argument(
                 "--advantage-estimator",
                 type=str,
+<<<<<<< HEAD
                 choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline", "ppo"],
+=======
+                choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline", "reverse_kl"],
+>>>>>>> c270d0b (clean)
                 default="grpo",
             )
             parser.add_argument(
@@ -1431,9 +1475,12 @@ def slime_validate_args(args):
         args.wandb_name = getattr(args, "wandb_group", None)
 >>>>>>> b25c8ed (POLARIS update)
 
-    if args.kl_coef != 0 or args.use_kl_loss:
-        if not os.path.exists(args.ref_load):
-            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+    if args.kl_coef != 0 or args.use_kl_loss or (args.enable_on_policy_distill and args.distill_teacher_url is None):
+        if not args.ref_load or not os.path.exists(args.ref_load):
+            raise FileNotFoundError(
+                f"ref_load {args.ref_load} does not exist, please check the path. "
+                "It is required when using KL rewards without an external teacher."
+            )
 
         if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
             print(
@@ -1469,8 +1516,31 @@ def slime_validate_args(args):
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
 
+<<<<<<< HEAD
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
+=======
+    if args.enable_on_policy_distill:
+        if args.advantage_estimator != "reverse_kl":
+            if args.advantage_estimator == "grpo":
+                print(
+                    "[On-Policy Distill] Overriding --advantage-estimator to 'reverse_kl' "
+                    "to use teacher log-prob advantages."
+                )
+                args.advantage_estimator = "reverse_kl"
+            else:
+                raise ValueError(
+                    "On-policy distillation requires --advantage-estimator to be 'reverse_kl'. "
+                    f"Got '{args.advantage_estimator}'."
+                )
+        if not args.compute_advantages_and_returns:
+            raise ValueError(
+                "On-policy distillation requires computing advantages. "
+                "Please omit --disable-compute-advantages-and-returns."
+            )
+        if args.loss_type != "policy_loss":
+            raise ValueError("On-policy distillation is only supported with --loss-type policy_loss.")
+>>>>>>> c270d0b (clean)
 
     if args.use_dynamic_batch_size:
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
@@ -1610,7 +1680,7 @@ def hf_validate_args(args, hf_config):
         ("num_attention_heads", "num_attention_heads", equal),
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
-        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+        ("tie_word_embeddings", "untie_embeddings_and_output_weights", None),
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rope_theta", "rotary_base", equal),
     ]:

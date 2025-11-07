@@ -201,6 +201,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data["rollout_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
                 )
             ]
+        if "teacher_log_probs" in rollout_data:
+            rollout_data["teacher_log_probs"] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(log_prob, total_length, response_length),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.float32,
+                )
+                for log_prob, total_length, response_length in zip(
+                    rollout_data["teacher_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
+                )
+            ]
         return rollout_data
 
     def compute_log_prob(
@@ -232,10 +243,18 @@ class MegatronTrainRayActor(TrainRayActor):
                 log_rollout_data(rollout_id, self.args, rollout_data)
                 return
 
+<<<<<<< HEAD
         if self.role == "critic":
             return self.train_critic(rollout_id, rollout_data)
         else:
             return self.train_actor(rollout_id, rollout_data)
+=======
+        with timer("train"):
+            with timer("data_preprocess"):
+                rollout_data = self._get_rollout_data(rollout_data_ref)
+                if "teacher_log_probs" in rollout_data:
+                    rollout_data["ref_log_probs"] = rollout_data.pop("teacher_log_probs")
+>>>>>>> c270d0b (clean)
 
 <<<<<<< HEAD
     def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:

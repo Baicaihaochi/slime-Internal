@@ -198,12 +198,55 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     return sample
 
 
+<<<<<<< HEAD
 async def generate_and_rm(
     args: Namespace,
     sample: Union[Sample, list[Sample]],
     sampling_params: dict[str, Any],
     evaluation: bool = False,
 ) -> Union[Sample, list[Sample]]:
+=======
+async def maybe_fetch_teacher_logprobs(args, sample: Sample, evaluation: bool = False) -> Sample:
+    """Optionally fetch teacher log probabilities for a completed sample."""
+    if evaluation or args.distill_teacher_url is None:
+        return sample
+
+    if sample.teacher_log_probs is not None:
+        return sample
+
+    prompt_len = len(sample.tokens) - sample.response_length
+    if prompt_len < 0 or sample.response_length <= 0:
+        return sample
+
+    payload = {
+        "prompt_tokens": sample.tokens[:prompt_len],
+        "completion_tokens": sample.tokens[prompt_len:],
+    }
+
+    try:
+        response = await post(args.distill_teacher_url, payload, use_http2=args.use_http2)
+    except Exception as exc:  # pragma: no cover - best-effort logging
+        print(f"[Teacher] Failed to fetch logprobs: {exc}")
+        return sample
+
+    log_probs = response.get("logprobs")
+    if not isinstance(log_probs, list):
+        print("[Teacher] Unexpected teacher response format, expected 'logprobs' list.")
+        return sample
+
+    if len(log_probs) != sample.response_length:
+        print(
+            "[Teacher] Teacher logprob length mismatch: "
+            f"expected {sample.response_length}, got {len(log_probs)}."
+        )
+        return sample
+
+    sample.teacher_log_probs = log_probs
+    return sample
+
+
+async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluation=False) -> Sample:
+>>>>>>> c270d0b (clean)
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None
@@ -225,6 +268,35 @@ async def generate_and_rm(
         else:
             sample = await generate(args, sample, sampling_params)
 
+    if args.enable_on_policy_distill and not evaluation:
+        if isinstance(sample, list):
+            updated = []
+            for item in sample:
+                if isinstance(item, Sample):
+                    if item.reward is None:
+                        item.reward = 0.0
+                    if args.distill_teacher_url is not None:
+                        item = await maybe_fetch_teacher_logprobs(args, item, evaluation=evaluation)
+                        if item.teacher_log_probs is None:
+                            raise RuntimeError(
+                                "On-policy distillation requires teacher log probabilities, "
+                                "but teacher response was missing for a rollout sample. "
+                                "Verify the teacher endpoint."
+                            )
+                updated.append(item)
+            return updated
+        if sample.reward is None:
+            sample.reward = 0.0
+        if args.distill_teacher_url is not None:
+            sample = await maybe_fetch_teacher_logprobs(args, sample, evaluation=evaluation)
+            if sample.teacher_log_probs is None:
+                raise RuntimeError(
+                    "On-policy distillation requires teacher log probabilities, "
+                    "but teacher response was missing for a rollout sample. "
+                    "Verify the teacher endpoint."
+                )
+        return sample
+
     # for the rm that need the whole group, we will not do the rm here
     if args.group_rm:
         return sample
@@ -240,12 +312,34 @@ async def generate_and_rm(
         rewards = await batched_async_rm(args, samples_need_reward, evaluation=evaluation)
         for sample, reward in zip(samples_need_reward, rewards):
             sample.reward = reward
+        if args.enable_on_policy_distill and args.distill_teacher_url is not None:
+            samples = await asyncio.gather(
+                *[maybe_fetch_teacher_logprobs(args, sample, evaluation=evaluation) for sample in samples]
+            )
+            if not evaluation:
+                missing = [idx for idx, item in enumerate(samples) if item.teacher_log_probs is None]
+                if missing:
+                    preview = ", ".join(map(str, missing[:5]))
+                    if len(missing) > 5:
+                        preview += ", ..."
+                    raise RuntimeError(
+                        "On-policy distillation requires teacher log probabilities for every rollout sample; "
+                        f"missing entries detected at indices: {preview}. Verify the teacher endpoint."
+                    )
         return samples
     else:
         if sample.status == Sample.Status.ABORTED:
             return sample
 
         sample.reward = await async_rm(args, sample, evaluation=evaluation)
+
+    if args.enable_on_policy_distill and args.distill_teacher_url is not None:
+        sample = await maybe_fetch_teacher_logprobs(args, sample, evaluation=evaluation)
+        if not evaluation and sample.teacher_log_probs is None:
+            raise RuntimeError(
+                "On-policy distillation requires teacher log probabilities for every rollout sample. "
+                "Teacher response missing; verify the teacher endpoint."
+            )
 
     return sample
 
