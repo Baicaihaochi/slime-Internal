@@ -197,6 +197,17 @@ class MegatronTrainRayActor(TrainRayActor):
                     rollout_data["rollout_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
                 )
             ]
+        if "teacher_log_probs" in rollout_data:
+            rollout_data["teacher_log_probs"] = [
+                torch.tensor(
+                    slice_log_prob_with_cp(log_prob, total_length, response_length),
+                    device=torch.cuda.current_device(),
+                    dtype=torch.float32,
+                )
+                for log_prob, total_length, response_length in zip(
+                    rollout_data["teacher_log_probs"], rollout_data["total_lengths"], rollout_data["response_lengths"]
+                )
+            ]
         return rollout_data
 
     def compute_log_prob(
@@ -234,6 +245,8 @@ class MegatronTrainRayActor(TrainRayActor):
         with timer("train"):
             with timer("data_preprocess"):
                 rollout_data = self._get_rollout_data(rollout_data_ref)
+                if "teacher_log_probs" in rollout_data:
+                    rollout_data["ref_log_probs"] = rollout_data.pop("teacher_log_probs")
 
                 # POLARIS: Apply dynamic sampling and reward tracking
                 # This should be done before computing advantages_and_returns

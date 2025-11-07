@@ -14,7 +14,7 @@ from slime.utils.ppo_utils import (
     get_reinforce_plus_plus_returns,
 )
 
-from .cp_utils import all_gather_with_cp, get_logits_and_tokens_offset_with_cp, get_sum_of_sample_mean
+from .cp_utils import (all_gather_with_cp,get_logits_and_tokens_offset_with_cp,get_sum_of_sample_mean,slice_log_prob_with_cp)
 
 
 def get_log_probs_and_entropy(
@@ -252,68 +252,175 @@ def get_log_probs_and_entropy(
 
 
 def compute_advantages_and_returns(args, rollout_data):
-    log_probs: list[torch.Tensor] = rollout_data.get("log_probs", None)
-    ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs", None)
-    rewards: list[float] = rollout_data.get("rewards", None)
+    log_probs: list[torch.Tensor] | None = rollout_data.get("log_probs", None)
+    rollout_log_probs: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs", None)
+    ref_log_probs: list[torch.Tensor] | None = rollout_data.get("ref_log_probs", None)
+    rewards: list[float] | None = rollout_data.get("rewards", None)
     values: Union[None, list[torch.Tensor]] = rollout_data.get("values", None)
-    response_lengths: list[int] = rollout_data.get("response_lengths", None)
-    loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks", None)
-    total_lengths: list[int] = rollout_data.get("total_lengths", None)
+    response_lengths: list[int] | None = rollout_data.get("response_lengths", None)
+    loss_masks: list[torch.Tensor] | None = rollout_data.get("loss_masks", None)
+    total_lengths: list[int] | None = rollout_data.get("total_lengths", None)
 
-    if log_probs is None:
+    if log_probs is None or loss_masks is None or response_lengths is None or total_lengths is None:
         return
 
-    if args.kl_coef == 0:
-        # when kl_coef is 0, we won't compute ref_log_prob
-        kl = [
-            torch.zeros_like(
-                log_probs[i],
-                dtype=torch.float32,
-                device=log_probs[i].device,
-            )
-            for i in range(len(log_probs))
-        ]
-    else:
-        kl = [
-            compute_approx_kl(
-                log_probs[i],
-                ref_log_probs[i],
-                kl_loss_type=args.kl_loss_type,
-            )
-            for i in range(len(log_probs))
-        ]
-    rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
+    use_is_distill_loss = getattr(args, "enable_on_policy_distill", False) and getattr(
+        args, "use_is_distill_loss", False
+    )
 
-    if args.advantage_estimator in ["grpo", "gspo"]:
-        returns = get_grpo_returns(rewards, kl)
-        # TODO: is the copy necessary?
-        advantages = [r for r in returns]
-
-    elif args.advantage_estimator == "reinforce_plus_plus":
-        returns = get_reinforce_plus_plus_returns(
+    if use_is_distill_loss:
+        _compute_is_distill_advantages(
+            args=args,
+            rollout_data=rollout_data,
+            rollout_log_probs=rollout_log_probs,
+            teacher_log_probs=ref_log_probs,
             rewards=rewards,
-            kl=kl,
             loss_masks=loss_masks,
-            response_lengths=response_lengths,
             total_lengths=total_lengths,
-            kl_coef=args.kl_coef,
-            gamma=args.gamma,
+            response_lengths=response_lengths,
         )
-        advantages = [r for r in returns]
+        return
 
-    elif args.advantage_estimator == "reinforce_plus_plus_baseline":
-        advantages = get_reinforce_plus_plus_baseline_advantages(
-            rewards=rewards,
-            kl=kl,
-            loss_masks=loss_masks,
-            kl_coef=args.kl_coef,
-        )
-        returns = advantages
+    reverse_kl_stats: list[float] | None = None
+    if args.advantage_estimator == "reverse_kl":
+        if ref_log_probs is None:
+            raise ValueError("On-policy distillation requires teacher log probabilities (ref_log_probs).")
+        if rewards is None:
+            raise ValueError("reverse_kl advantage estimator requires rollout rewards for baseline computation.")
 
+        if not getattr(args, "balance_data", False):
+            raise ValueError(
+                "reverse_kl advantage estimator requires --balance-data to keep prompt groups intact."
+            )
+
+        device = loss_masks[0].device
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
+        group_size = max(int(getattr(args, "n_samples_per_prompt", 1)), 1)
+
+        if rewards_tensor.numel() % group_size != 0:
+            raise ValueError(
+                f"Number of rewards {rewards_tensor.numel()} is not divisible by "
+                f"group size n_samples_per_prompt={group_size}."
+            )
+
+        rewards_reshaped = rewards_tensor.view(-1, group_size)
+        centered_rewards = rewards_reshaped - rewards_reshaped.mean(dim=1, keepdim=True)
+        reward_scalars = centered_rewards.reshape(-1).tolist()
+
+        advantages: list[torch.Tensor] = []
+        returns: list[torch.Tensor] = []
+        reverse_kl_stats = []
+        reward_advantages: list[torch.Tensor] = []
+        cp_size = mpu.get_context_parallel_world_size()
+        kl_coef = getattr(args, "kl_penalty_coef", getattr(args, "kl_coef", 0.0))
+        debug_printed = True
+
+        for idx, (student_lp_raw, teacher_lp_raw, mask_tensor, total_len, resp_len) in enumerate(
+            zip(rollout_log_probs, ref_log_probs, loss_masks, total_lengths, response_lengths)
+        ):
+            mask_local = mask_tensor
+            if cp_size > 1:
+                mask_local = slice_log_prob_with_cp(mask_tensor, total_len, resp_len)
+                if isinstance(mask_local, list):
+                    mask_local = torch.tensor(mask_local, dtype=mask_tensor.dtype, device=mask_tensor.device)
+
+            if mask_local.numel() == 0 or student_lp_raw.numel() == 0:
+                print(
+                    f"[Distill] Skip sample {idx} due to empty tensors "
+                    f"(len mask={mask_local.numel()}, student={student_lp_raw.numel()})."
+                )
+                continue
+
+            student_lp = student_lp_raw
+            teacher_lp = teacher_lp_raw
+            if isinstance(student_lp, list):
+                student_lp = torch.tensor(student_lp, dtype=torch.float32, device=device)
+            if isinstance(teacher_lp, list):
+                teacher_lp = torch.tensor(teacher_lp, dtype=torch.float32, device=device)
+
+            if student_lp.numel() != teacher_lp.numel() or student_lp.numel() != mask_local.numel():
+                raise RuntimeError(
+                    f"[Distill] CP slicing mismatch for sample {idx}: "
+                    f"student={student_lp.numel()}, teacher={teacher_lp.numel()}, mask={mask_local.numel()}"
+                )
+
+            mask_float = mask_local.to(dtype=torch.float32, device=device)
+            reward_component = mask_float * reward_scalars[idx]
+            reward_advantages.append(reward_component)
+
+            student_lp = student_lp.to(device=device, dtype=torch.float32)
+            teacher_lp = teacher_lp.to(device=device, dtype=torch.float32)
+            reverse_kl = (student_lp - teacher_lp) * mask_float
+            ##############################################################################################################################
+            composite_adv = reward_component - kl_coef * reverse_kl
+            advantages.append(composite_adv)
+            returns.append(reward_component.clone())
+
+            denom = torch.clamp_min(mask_float.sum(), 1.0)
+            sample_mean = reverse_kl.sum() / denom
+            reverse_kl_stats.append(float(sample_mean.detach().cpu()))
+
+            if (
+                not debug_printed
+                and mpu.get_tensor_model_parallel_rank() == 0
+                and mpu.is_pipeline_last_stage()
+            ):
+                student_dbg = student_lp[:100].detach().float().cpu().tolist()
+                teacher_dbg = teacher_lp[:100].detach().float().cpu().tolist()
+                print(f"[Distill] Sample {idx} student_lp[:100]={student_dbg}")
+                print(f"[Distill] Sample {idx} teacher_lp[:100]={teacher_dbg}")
+                debug_printed = True
+
+        kl = None
     else:
-        raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+        if args.kl_coef == 0:
+            kl = [
+                torch.zeros_like(
+                    log_probs[i],
+                    dtype=torch.float32,
+                    device=log_probs[i].device,
+                )
+                for i in range(len(log_probs))
+            ]
+        else:
+            kl = [
+                compute_approx_kl(
+                    log_probs[i],
+                    ref_log_probs[i],
+                    kl_loss_type=args.kl_loss_type,
+                )
+                for i in range(len(log_probs))
+            ]
+        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
 
-    # TODO: OpenRLHF always does advantages normalization but veRL doesn't seem to do it.
+        if args.advantage_estimator in ["grpo", "gspo"]:
+            returns = get_grpo_returns(rewards, kl)
+            advantages = [r for r in returns]
+
+        elif args.advantage_estimator == "reinforce_plus_plus":
+            returns = get_reinforce_plus_plus_returns(
+                rewards=rewards,
+                kl=kl,
+                loss_masks=loss_masks,
+                response_lengths=response_lengths,
+                total_lengths=total_lengths,
+                kl_coef=args.kl_coef,
+                gamma=args.gamma,
+            )
+            advantages = [r for r in returns]
+
+        elif args.advantage_estimator == "reinforce_plus_plus_baseline":
+            advantages = get_reinforce_plus_plus_baseline_advantages(
+                rewards=rewards,
+                kl=kl,
+                loss_masks=loss_masks,
+                kl_coef=args.kl_coef,
+            )
+            returns = advantages
+
+        else:
+            raise NotImplementedError(f"advantage_estimator {args.advantage_estimator} is not supported. ")
+
     if args.normalize_advantages:
         all_advs = torch.cat(advantages)
         cp_size = mpu.get_context_parallel_world_size()
@@ -328,7 +435,6 @@ def compute_advantages_and_returns(args, rollout_data):
 
                 _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len)
 
-                # Convert global offsets to response-space offsets
                 s0, e0 = token_offsets[0]
                 s1, e1 = token_offsets[1]
                 res_s0, res_e0 = max(0, s0 - prompt_len), max(0, e0 - prompt_len)
@@ -341,7 +447,6 @@ def compute_advantages_and_returns(args, rollout_data):
                 if res_e1 > res_s1:
                     local_mask_parts.append(full_mask[res_s1:res_e1])
 
-                # Concatenate the parts to form the final mask chunk for this rank and this sequence
                 local_mask_chunk = (
                     torch.cat(local_mask_parts)
                     if local_mask_parts
@@ -362,6 +467,197 @@ def compute_advantages_and_returns(args, rollout_data):
 
     rollout_data["advantages"] = advantages
     rollout_data["returns"] = returns
+    if reverse_kl_stats is not None:
+        rollout_data["reverse_kl"] = reverse_kl_stats
+
+
+def _compute_is_distill_advantages(
+    *,
+    args,
+    rollout_data: dict,
+    rollout_log_probs: list[torch.Tensor] | None,
+    teacher_log_probs: list[torch.Tensor] | None,
+    rewards: list[float] | None,
+    loss_masks: list[torch.Tensor],
+    total_lengths: list[int],
+    response_lengths: list[int],
+) -> None:
+    """
+    Construct composite on-policy distillation advantages, mirroring Tinker Cookbook:
+
+        A_t = A_t^{reward} - kl_coef * (log p_student,t - log p_teacher,t)
+    """
+    if rollout_log_probs is None or teacher_log_probs is None:
+        raise ValueError(
+            "On-policy distillation with importance-sampling loss requires teacher and rollout log probabilities."
+        )
+
+    device = loss_masks[0].device
+    cp_size = mpu.get_context_parallel_world_size()
+
+    # ----- reward component -----
+    reward_advantages: list[torch.Tensor] = []
+    returns: list[torch.Tensor] = []
+    if rewards is None or args.advantage_estimator == "reverse_kl":
+        for mask in loss_masks:
+            zeros = torch.zeros_like(mask, dtype=torch.float32, device=device)
+            reward_advantages.append(zeros)
+            returns.append(zeros.clone())
+    else:
+        rewards_tensor = torch.tensor(rewards, dtype=torch.float32, device=device)
+        if args.advantage_estimator in ["grpo", "gspo"]:
+            returns = get_grpo_returns(rewards_tensor, None)
+            reward_advantages = [ret.clone().to(device=device) for ret in returns]
+        elif args.advantage_estimator == "reinforce_plus_plus":
+            returns = get_reinforce_plus_plus_returns(
+                rewards=rewards_tensor,
+                kl=None,
+                loss_masks=loss_masks,
+                response_lengths=response_lengths,
+                total_lengths=total_lengths,
+                kl_coef=0.0,
+                gamma=args.gamma,
+            )
+            reward_advantages = [ret.clone().to(device=device) for ret in returns]
+        elif args.advantage_estimator == "reinforce_plus_plus_baseline":
+            reward_advantages = get_reinforce_plus_plus_baseline_advantages(
+                rewards=rewards_tensor,
+                kl=None,
+                loss_masks=loss_masks,
+                kl_coef=0.0,
+            )
+            reward_advantages = [adv.to(device=device) for adv in reward_advantages]
+            returns = [adv.clone() for adv in reward_advantages]
+        else:
+            raise NotImplementedError(
+                f"advantage_estimator '{args.advantage_estimator}' is not supported with IS distillation."
+            )
+
+    # ----- KL component -----
+    kl_coef = getattr(args, "kl_penalty_coef", getattr(args, "kl_coef", 0.0))
+    composite_advantages: list[torch.Tensor] = []
+    reverse_kl_stats: list[float] = []
+
+    def _slice_tensor_with_cp(tensor: torch.Tensor, total_len: int, resp_len: int) -> torch.Tensor:
+        if cp_size == 1:
+            return tensor
+
+        prompt_len = total_len - resp_len
+        _, _, _, tokens_offset = get_logits_and_tokens_offset_with_cp(total_len, resp_len)
+
+        slices = []
+        for start, end in tokens_offset:
+            if end <= start:
+                continue
+            offset_start = max(start - prompt_len, 0)
+            offset_end = max(end - prompt_len, 0)
+            if offset_end > offset_start:
+                slices.append(tensor[offset_start:offset_end])
+        if not slices:
+            return torch.zeros(0, dtype=tensor.dtype, device=tensor.device)
+        return torch.cat(slices, dim=0)
+
+    for idx, reward_adv in enumerate(reward_advantages):
+        reward_adv = reward_adv.to(device=device, dtype=torch.float32)
+        mask = loss_masks[idx].to(device=device)
+        mask_float = mask.to(dtype=torch.float32)
+
+        if reward_adv.numel() != mask_float.numel():
+            raise RuntimeError(
+                f"[Distill] Reward advantage/mask mismatch for sample {idx}: "
+                f"adv={reward_adv.size()}, mask={mask_float.size()}"
+            )
+
+        if kl_coef != 0.0:
+            total_len = total_lengths[idx]
+            resp_len = response_lengths[idx]
+
+            student_lp_raw = rollout_log_probs[idx]
+            teacher_lp_raw = teacher_log_probs[idx]
+
+            if cp_size > 1:
+                student_lp_full = all_gather_with_cp(student_lp_raw, total_len, resp_len)
+                teacher_lp_full = all_gather_with_cp(teacher_lp_raw, total_len, resp_len)
+                student_lp = student_lp_full[-resp_len:]
+                teacher_lp = teacher_lp_full[-resp_len:]
+            else:
+                student_lp = student_lp_raw[-resp_len:] if student_lp_raw.numel() != resp_len else student_lp_raw
+                teacher_lp = teacher_lp_raw[-resp_len:] if teacher_lp_raw.numel() != resp_len else teacher_lp_raw
+
+            if isinstance(student_lp, list):
+                student_lp = torch.tensor(student_lp, dtype=torch.float32, device=device)
+            if isinstance(teacher_lp, list):
+                teacher_lp = torch.tensor(teacher_lp, dtype=torch.float32, device=device)
+
+            if student_lp.numel() != teacher_lp.numel() or student_lp.numel() != reward_adv.numel():
+                raise RuntimeError(
+                    f"[Distill] KL shapes mismatch for sample {idx}: "
+                    f"student={student_lp.shape}, teacher={teacher_lp.shape}, reward_adv={reward_adv.shape}"
+                )
+
+            student_lp = student_lp.to(device=device, dtype=torch.float32)
+            teacher_lp = teacher_lp.to(device=device, dtype=torch.float32)
+
+            kl_delta = (student_lp - teacher_lp) * mask_float
+            denom = torch.clamp_min(mask_float.sum(), 1.0)
+            reverse_kl_stats.append(float((kl_delta.sum() / denom).detach().cpu()))
+
+            composite_adv = reward_adv - kl_coef * kl_delta
+        else:
+            reverse_kl_stats.append(0.0)
+            composite_adv = reward_adv
+
+        if cp_size > 1:
+            total_len = total_lengths[idx]
+            resp_len = response_lengths[idx]
+            reward_adv = _slice_tensor_with_cp(reward_adv, total_len, resp_len)
+            composite_adv = _slice_tensor_with_cp(composite_adv, total_len, resp_len)
+
+        composite_advantages.append(composite_adv)
+        reward_advantages[idx] = reward_adv
+
+    # ----- optional whitening -----
+    if args.normalize_advantages and composite_advantages:
+        all_advs = torch.cat(composite_advantages)
+        if cp_size == 1:
+            all_masks = torch.cat(loss_masks).to(device=device)
+        else:
+            mask_chunks = []
+            for i in range(len(composite_advantages)):
+                total_len = total_lengths[i]
+                response_len = response_lengths[i]
+                prompt_len = total_len - response_len
+                _, _, _, token_offsets = get_logits_and_tokens_offset_with_cp(total_len, response_len)
+
+                s0, e0 = token_offsets[0]
+                s1, e1 = token_offsets[1]
+                res_s0, res_e0 = max(0, s0 - prompt_len), max(0, e0 - prompt_len)
+                res_s1, res_e1 = max(0, s1 - prompt_len), max(0, e1 - prompt_len)
+
+                full_mask = loss_masks[i].to(device=device)
+                local_parts = []
+                if res_e0 > res_s0:
+                    local_parts.append(full_mask[res_s0:res_e0])
+                if res_e1 > res_s1:
+                    local_parts.append(full_mask[res_s1:res_e1])
+                mask_chunks.append(torch.cat(local_parts) if local_parts else torch.tensor([], device=device))
+            all_masks = torch.cat(mask_chunks)
+
+        if all_masks.numel() > 0:
+            whitened = distributed_masked_whiten(all_advs, all_masks.to(all_advs.device), shift_mean=True)
+            chunk_lengths = [adv.size(0) for adv in composite_advantages]
+            composite_advantages = list(torch.split(whitened, chunk_lengths))
+
+    if cp_size > 1 and returns:
+        returns = [
+            _slice_tensor_with_cp(ret.to(device=device, dtype=torch.float32), total_lengths[idx], response_lengths[idx])
+            for idx, ret in enumerate(returns)
+        ]
+
+    rollout_data["reward_advantages"] = reward_advantages
+    rollout_data["advantages"] = composite_advantages
+    rollout_data["returns"] = returns
+    rollout_data["reverse_kl"] = reverse_kl_stats
 
 
 def policy_loss_function(args, batch, logits, sum_of_sample_mean):
@@ -440,6 +736,14 @@ def policy_loss_function(args, batch, logits, sum_of_sample_mean):
             sum_of_sample_mean = get_sum_of_sample_mean(
                 total_lengths, response_lengths, batch["loss_masks"], args.calculate_per_token_loss
             )
+
+    if getattr(args, "enable_on_policy_distill", False) and getattr(args, "use_is_distill_loss", False):
+        return _importance_sampling_policy_loss(
+            args=args,
+            batch=batch,
+            current_log_probs=log_probs,
+            sum_of_sample_mean=sum_of_sample_mean,
+        )
 
     old_log_probs_flat: torch.Tensor | None = None
     if args.advantage_estimator == "gspo":
@@ -709,3 +1013,60 @@ def loss_function(args, batch, num_microbatches, logits):
             ),
         },
     )
+
+
+def _importance_sampling_policy_loss(*, args, batch, current_log_probs, sum_of_sample_mean):
+    """
+    Importance-sampling policy gradient used for on-policy distillation:
+
+        L = - Σ_t mask_t · A_t · log p_θ(x_t | x_{<t})
+
+    where advantages already encode reward and KL components.
+    """
+    advantages = batch["advantages"]
+    loss_masks = batch["loss_masks"]
+    total_lengths = batch["total_lengths"]
+    response_lengths = batch["response_lengths"]
+
+    cp_size = mpu.get_context_parallel_world_size()
+    device = current_log_probs[0].device
+
+    per_token_terms: list[torch.Tensor] = []
+    adv_sum = torch.tensor(0.0, device=device)
+    weight_sum = torch.tensor(0.0, device=device)
+
+    for idx, (adv, logprob, mask) in enumerate(zip(advantages, current_log_probs, loss_masks)):
+        adv_local = adv.to(device=device, dtype=logprob.dtype)
+        mask_tensor = mask
+        if cp_size > 1:
+            mask_tensor = slice_log_prob_with_cp(mask, total_lengths[idx], response_lengths[idx])
+            if isinstance(mask_tensor, list):
+                mask_tensor = torch.tensor(mask_tensor, device=device, dtype=logprob.dtype)
+        mask_float = mask_tensor.to(device=device, dtype=logprob.dtype)
+
+        if adv_local.numel() != mask_float.numel() or logprob.numel() != mask_float.numel():
+            raise RuntimeError(
+                f"[Distill] Advantage/logprob mismatch for sample {idx}: "
+                f"adv={adv_local.size()}, logprob={logprob.size()}, mask={mask_float.size()}"
+            )
+
+        weighted_adv = adv_local * mask_float
+        per_token_terms.append(weighted_adv * logprob)
+        adv_sum += weighted_adv.sum()
+        weight_sum += mask_float.sum()
+
+    if per_token_terms:
+        loss_tensor = torch.cat(per_token_terms, dim=0)
+        loss = -sum_of_sample_mean(loss_tensor)
+    else:
+        loss = torch.tensor(0.0, device=device)
+
+
+    avg_adv = (adv_sum / torch.clamp_min(weight_sum, 1.0)).detach().cpu().item()
+    token_count = weight_sum.detach().cpu().item()
+
+    log = {
+        "policy/adv_mean": avg_adv,
+        "policy/token_count": token_count,
+    }
+    return loss, log
