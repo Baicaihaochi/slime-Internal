@@ -4,10 +4,6 @@ import os
 from typing import Any, Dict
 
 import yaml
-<<<<<<< HEAD
-=======
-
->>>>>>> 2e08677 (MIS Integration)
 from transformers import AutoConfig
 
 from slime.backends.sglang_utils.arguments import add_sglang_arguments
@@ -732,11 +728,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument(
                 "--advantage-estimator",
                 type=str,
-<<<<<<< HEAD
-                choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline", "ppo"],
-=======
-                choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline", "reverse_kl"],
->>>>>>> c270d0b (clean)
+                choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline", "ppo", "reverse_kl"],
                 default="grpo",
             )
             parser.add_argument(
@@ -855,7 +847,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=None,
                 help="Path to the custom TIS function.",
             )
-<<<<<<< HEAD
 
             parser.add_argument(
                 "--use-routing-replay",
@@ -877,8 +868,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 nargs="+",
                 default="",
             )
-=======
->>>>>>> 2e08677 (MIS Integration)
             return parser
 
         # wandb
@@ -1220,14 +1209,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
-<<<<<<< HEAD
         def add_sglang_tp_size():
             temp_parser = argparse.ArgumentParser(add_help=False)
             temp_parser.add_argument("--rollout-num-gpus-per-engine", type=int, default=1)
             temp_args, _ = temp_parser.parse_known_args()
             sglang_tp_size = temp_args.rollout_num_gpus_per_engine
             return sglang_tp_size
-=======
         def add_polaris_arguments(parser):
             """
             Add POLARIS-style training tricks arguments.
@@ -1298,7 +1285,6 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             return parser
->>>>>>> b25c8ed (POLARIS update)
 
         # Add custom arguments in front to prevent overwritten some slime arguments.
         if add_custom_arguments is not None:
@@ -1319,11 +1305,7 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
-<<<<<<< HEAD
         parser = add_mtp_training_arguments(parser)
-        parser = add_q_tuning_arguments(parser)
-=======
->>>>>>> bf1d677 (add CISPO loss & rm q tuning)
         parser = add_polaris_arguments(parser)
         parser = add_ci_arguments(parser)
         parser.set_defaults(sglang_tensor_parallel_size=add_sglang_tp_size())
@@ -1459,9 +1441,7 @@ def _resolve_eval_datasets(args) -> list[EvalDatasetConfig]:
 
 
 def slime_validate_args(args):
-<<<<<<< HEAD
     args.eval_datasets = _resolve_eval_datasets(args)
-=======
     # Harmonize backward compatibility aliases used in POLARIS examples.
     if getattr(args, "rollout_data_path", None) and getattr(args, "prompt_data", None) is None:
         args.prompt_data = args.rollout_data_path
@@ -1473,7 +1453,6 @@ def slime_validate_args(args):
             args.wandb_group = args.wandb_name
     else:
         args.wandb_name = getattr(args, "wandb_group", None)
->>>>>>> b25c8ed (POLARIS update)
 
     if args.kl_coef != 0 or args.use_kl_loss or (args.enable_on_policy_distill and args.distill_teacher_url is None):
         if not args.ref_load or not os.path.exists(args.ref_load):
@@ -1516,10 +1495,8 @@ def slime_validate_args(args):
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
 
-<<<<<<< HEAD
     if args.use_rollout_logprobs:
         assert not args.use_tis, "use_rollout_logprobs and use_tis cannot be set at the same time."
-=======
     if args.enable_on_policy_distill:
         if args.advantage_estimator != "reverse_kl":
             if args.advantage_estimator == "grpo":
@@ -1540,7 +1517,6 @@ def slime_validate_args(args):
             )
         if args.loss_type != "policy_loss":
             raise ValueError("On-policy distillation is only supported with --loss-type policy_loss.")
->>>>>>> c270d0b (clean)
 
     if args.use_dynamic_batch_size:
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
@@ -1656,14 +1632,10 @@ def slime_validate_args(args):
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
 
-<<<<<<< HEAD
     if args.enable_mtp_training:
         assert args.mtp_num_layers, "mtp_num_layers must be set when enable_mtp_training is set"
 
     if args.custom_config_path:
-=======
-    if getattr(args, "custom_config_path", None):
->>>>>>> 2e08677 (MIS Integration)
         with open(args.custom_config_path, "r") as f:
             data = yaml.safe_load(f) or {}
         for k, v in data.items():

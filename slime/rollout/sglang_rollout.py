@@ -198,14 +198,6 @@ async def generate(args: Namespace, sample: Sample, sampling_params: dict[str, A
     return sample
 
 
-<<<<<<< HEAD
-async def generate_and_rm(
-    args: Namespace,
-    sample: Union[Sample, list[Sample]],
-    sampling_params: dict[str, Any],
-    evaluation: bool = False,
-) -> Union[Sample, list[Sample]]:
-=======
 async def maybe_fetch_teacher_logprobs(args, sample: Sample, evaluation: bool = False) -> Sample:
     """Optionally fetch teacher log probabilities for a completed sample."""
     if evaluation or args.distill_teacher_url is None:
@@ -246,7 +238,6 @@ async def maybe_fetch_teacher_logprobs(args, sample: Sample, evaluation: bool = 
 
 
 async def generate_and_rm(args, sample: Sample, sampling_params: dict, evaluation=False) -> Sample:
->>>>>>> c270d0b (clean)
     # For samples with existing response, check if they're complete
     if sample.status == Sample.Status.COMPLETED or sample.status == Sample.Status.TRUNCATED:
         assert sample.response is not None

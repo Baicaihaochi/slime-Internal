@@ -57,15 +57,11 @@ def read_file(path):
             raise ValueError(f"Unsupported JSON structure: {type(data)}")
         return
     else:
-<<<<<<< HEAD
         raise ValueError(f"Unsupported file format: {path}. Supported formats are .jsonl and .parquet.")
 
     if row_slice is not None:
         print(f"read_file path={path} slice {len(df)=} rows into {row_slice=}")
         df = df.iloc[row_slice]
-=======
-        raise ValueError(f"Unsupported file format: {path}. Supported formats are .json, .jsonl and .parquet.")
->>>>>>> b25c8ed (POLARIS update)
 
     for _, row in df.iterrows():
         yield row.to_dict()

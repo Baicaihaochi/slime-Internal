@@ -119,12 +119,9 @@ def get_responses(
     logits = logits.div(args.rollout_temperature)
 
     cp_size = mpu.get_context_parallel_world_size()
-<<<<<<< HEAD
-=======
     log_probs_list = []
     if with_entropy:
         entropy_list = []
->>>>>>> b25c8ed (POLARIS update)
     end = 0
     for sample_idx, (tokens, total_length, response_length) in enumerate(
         zip(unconcat_tokens, total_lengths, response_lengths)
@@ -134,8 +131,6 @@ def get_responses(
             start = end - response_length
             logits_chunk = logits[start - 1 : end - 1]
             tokens_chunk = tokens[-response_length:]
-<<<<<<< HEAD
-=======
 
             sanitized = False
             if not torch.isfinite(logits_chunk).all():
@@ -178,7 +173,6 @@ def get_responses(
                 log_prob, entropy = calculate_log_probs_and_entropy(
                     logits_chunk, tokens_chunk, mpu.get_tensor_model_parallel_group(), with_entropy=with_entropy
                 )
->>>>>>> b25c8ed (POLARIS update)
         else:
             # TODO: this is super ugly... do better abstraction.
             chunk_size, chunks_offset, logits_offset, tokens_offset = get_logits_and_tokens_offset_with_cp(
@@ -197,10 +191,6 @@ def get_responses(
             assert logits_0.size(0) == tokens_0.size(0), f"{logits_0.size(0)} vs {tokens_0.size(0)}"
             assert logits_1.size(0) == tokens_1.size(0), f"{logits_1.size(0)} vs {tokens_1.size(0)}"
 
-<<<<<<< HEAD
-            logits_chunk = torch.cat([logits_0, logits_1], dim=0)
-            tokens_chunk = torch.cat([tokens_0, tokens_1], dim=0)
-=======
             sanitized = False
             if not torch.isfinite(logits_0).all():
                 _dump_non_finite(
@@ -270,7 +260,6 @@ def get_responses(
                 log_prob = torch.cat([log_prob_0, log_prob_1], dim=0)
                 if with_entropy:
                     entropy = torch.cat([entropy_0, entropy_1], dim=0)
->>>>>>> b25c8ed (POLARIS update)
 
         yield logits_chunk, tokens_chunk
 
@@ -332,129 +321,6 @@ def get_log_probs_and_entropy(
     return res
 
 
-<<<<<<< HEAD
-def get_values(
-    logits: torch.Tensor,
-    *,
-    args: Namespace,
-    unconcat_tokens: list[torch.Tensor],
-    total_lengths: list[int],
-    response_lengths: list[int],
-    non_loss_data: bool = True,
-) -> dict[str, list[torch.Tensor]]:
-    """Extract per-token value predictions over response tokens.
-
-    For each sample, extracts response-aligned chunks from the value head
-    output and squeezes the final dimension from `[R, 1]` to `[R]`.
-
-    Args:
-        logits: Value head output with shape `[1, T, 1]`.
-        args: Configuration (passed to `get_responses` which uses
-            `rollout_temperature` even though values don't need temperature).
-        unconcat_tokens: List of token tensors per sample.
-        total_lengths: Total sequence lengths per sample.
-        response_lengths: Response segment lengths per sample.
-        with_entropy: Unused; kept for signature compatibility.
-        non_loss_data: Unused; kept for signature compatibility.
-
-    Returns:
-        Dict with key "values" mapping to a list of `[R]` value tensors
-        per sample.
-    """
-    value_list = []
-    for logits_chunk, _ in get_responses(
-        logits,
-        args=args,
-        unconcat_tokens=unconcat_tokens,
-        total_lengths=total_lengths,
-        response_lengths=response_lengths,
-    ):
-        assert logits_chunk.size(-1) == 1, f"{logits_chunk.shape}"
-        value_list.append(logits_chunk.squeeze(-1))
-
-    return {
-        "values": value_list,
-    }
-
-
-def compute_advantages_and_returns(args: Namespace, rollout_data: RolloutBatch) -> None:
-    """Compute advantages and returns in-place based on `args.advantage_estimator`.
-
-    This function extracts rewards, log-probs, values, and masks from
-    `rollout_data`, computes KL divergences, then applies the chosen advantage
-    estimator. Supported methods: "grpo", "gspo", "ppo", "reinforce_plus_plus",
-    and "reinforce_plus_plus_baseline". When `args.normalize_advantages` is
-    True, advantages are whitened across the data-parallel group using masked
-    statistics.
-
-    Early returns if both `log_probs` and `values` are None (intermediate
-    pipeline stages).
-
-    Args:
-        args: Configuration specifying estimator type, KL coefficient,
-            normalization settings, and other hyperparameters.
-        rollout_data: Dict containing input lists ("log_probs", "ref_log_probs",
-            "rewards", "values", "response_lengths", "loss_masks",
-            "total_lengths"). Modified in-place to add "advantages" and
-            "returns" keys, each mapping to lists of tensors per sample.
-    """
-    log_probs: list[torch.Tensor] = rollout_data.get("log_probs")
-    ref_log_probs: list[torch.Tensor] = rollout_data.get("ref_log_probs")
-    rewards: list[float] = rollout_data.get("rewards")
-    values: Union[None, list[torch.Tensor]] = rollout_data.get("values")
-    response_lengths: list[int] = rollout_data.get("response_lengths")
-    loss_masks: list[torch.Tensor] = rollout_data.get("loss_masks")
-    total_lengths: list[int] = rollout_data.get("total_lengths")
-
-    # return when not the last pp stage.
-    if log_probs is None and values is None:
-        return
-
-    if args.kl_coef == 0 or not log_probs:
-        # when kl_coef is 0, we won't compute ref_log_prob
-        xs = log_probs if log_probs is not None else values
-        kl = [torch.zeros_like(x, dtype=torch.float32, device=x.device) for x in xs]
-    else:
-        kl = [
-            compute_approx_kl(
-                log_probs[i],
-                ref_log_probs[i],
-                kl_loss_type=args.kl_loss_type,
-            )
-            for i in range(len(log_probs))
-        ]
-
-    if args.advantage_estimator in ["grpo", "gspo"]:
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_grpo_returns(rewards, kl)
-        # TODO: is the copy necessary?
-        advantages = [r for r in returns]
-
-    elif args.advantage_estimator == "ppo":
-        # TODO: optimize this
-        old_rewards = rewards
-        rewards = []
-        for reward, k in zip(old_rewards, kl):
-            k *= -args.kl_coef
-            cp_rank = mpu.get_context_parallel_rank()
-            if cp_rank == 0:
-                k[-1] += reward
-            rewards.append(k)
-        advantages, returns = list(
-            zip(
-                *[
-                    get_advantages_and_returns(total_length, response_length, value, reward, args.gamma, args.lambd)
-                    for total_length, response_length, value, reward in zip(
-                        total_lengths, response_lengths, values, rewards
-                    )
-                ]
-            )
-        )
-
-    elif args.advantage_estimator == "reinforce_plus_plus":
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        returns = get_reinforce_plus_plus_returns(
-=======
 def compute_advantages_and_returns(args, rollout_data):
     log_probs: list[torch.Tensor] | None = rollout_data.get("log_probs", None)
     rollout_log_probs: list[torch.Tensor] | None = rollout_data.get("rollout_log_probs", None)
@@ -478,7 +344,6 @@ def compute_advantages_and_returns(args, rollout_data):
             rollout_data=rollout_data,
             rollout_log_probs=rollout_log_probs,
             teacher_log_probs=ref_log_probs,
->>>>>>> c270d0b (clean)
             rewards=rewards,
             loss_masks=loss_masks,
             total_lengths=total_lengths,
@@ -486,24 +351,12 @@ def compute_advantages_and_returns(args, rollout_data):
         )
         return
 
-<<<<<<< HEAD
-    elif args.advantage_estimator == "reinforce_plus_plus_baseline":
-        rewards = torch.tensor(rewards, dtype=torch.float32, device=kl[0].device)
-        advantages = get_reinforce_plus_plus_baseline_advantages(
-            rewards=rewards,
-            kl=kl,
-            loss_masks=loss_masks,
-            kl_coef=args.kl_coef,
-        )
-        returns = advantages
-=======
     reverse_kl_stats: list[float] | None = None
     if args.advantage_estimator == "reverse_kl":
         if ref_log_probs is None:
             raise ValueError("On-policy distillation requires teacher log probabilities (ref_log_probs).")
         if rewards is None:
             raise ValueError("reverse_kl advantage estimator requires rollout rewards for baseline computation.")
->>>>>>> c270d0b (clean)
 
         if not getattr(args, "balance_data", False):
             raise ValueError(
@@ -914,10 +767,6 @@ def policy_loss_function(
         are enabled.
     """
     advantages = torch.cat(batch["advantages"], dim=0)
-<<<<<<< HEAD
-    old_log_probs = batch["rollout_log_probs"] if args.use_rollout_logprobs else batch["log_probs"]
-=======
->>>>>>> bf1d677 (add CISPO loss & rm q tuning)
 
     response_lengths = batch["response_lengths"]
     total_lengths = batch["total_lengths"]
@@ -1022,11 +871,7 @@ def policy_loss_function(
         log_probs = torch.cat(log_probs, dim=0)
         old_log_probs_flat = torch.cat(full_old_log_probs, dim=0)
     else:
-<<<<<<< HEAD
-        old_log_probs = torch.cat(old_log_probs, dim=0)
-=======
         old_log_probs_flat = torch.cat(batch["log_probs"], dim=0)
->>>>>>> bf1d677 (add CISPO loss & rm q tuning)
         log_probs = torch.cat(log_probs, dim=0)
         ppo_kl = old_log_probs_flat - log_probs
 
@@ -1053,7 +898,7 @@ def policy_loss_function(
     else:
         pg_loss, pg_clipfrac = compute_policy_loss(ppo_kl, advantages, args.eps_clip, args.eps_clip_high)
 
-<<<<<<< HEAD
+
     # Apply off-policy correction using importance sampling if enabled
     if args.use_tis:
 
@@ -1083,11 +928,6 @@ def policy_loss_function(
         assert "rollout_log_probs" in batch, "rollout_log_probs must be provided for TIS"
 
         ois = (-ppo_kl).exp()
-<<<<<<< HEAD
-        tis_kwargs = {
-            "args": args,
-            "pg_loss": pg_loss,
-=======
     # Apply TIS off-policy correction using importance sampling if enabled
     tis_metrics = {}
     if args.use_tis:
@@ -1115,38 +955,22 @@ def policy_loss_function(
         ois = (-ppo_kl).exp()
         tis_kwargs = {
             "args": args,
->>>>>>> 2e08677 (MIS Integration)
             "train_log_probs": batch["log_probs"],
             "rollout_log_probs": batch["rollout_log_probs"],
             "loss_masks": batch["loss_masks"],
             "total_lengths": total_lengths,
             "response_lengths": response_lengths,
         }
-<<<<<<< HEAD
-=======
         tis_clip = torch.clamp(tis, min=args.tis_clip_low, max=args.tis_clip)
         tis_clipfrac = (tis_clip != tis).float()
->>>>>>> b914ff6 (tis_clipfrac type conversion)
-=======
->>>>>>> 2e08677 (MIS Integration)
 
         if args.custom_tis_function_path is not None:
             tis_func = load_function(args.custom_tis_function_path)
         else:
             tis_func = vanilla_tis_function
-<<<<<<< HEAD
-        pg_loss, modified_response_masks, tis_metrics = tis_func(**tis_kwargs)
-
-        # [decouple IS and rejection] Rebuild sum_of_sample_mean with modified_response_masks for denominator correction
-        # modified_response_masks will be sliced with cp in get_sum_of_sample_mean
-        sum_of_sample_mean = get_sum_of_sample_mean(
-            total_lengths, response_lengths, modified_response_masks, args.calculate_per_token_loss
-        )
-=======
         tis_weights, tis_metrics = tis_func(**tis_kwargs)
 
         pg_loss = pg_loss * tis_weights
->>>>>>> 2e08677 (MIS Integration)
 
     pg_loss = sum_of_sample_mean(pg_loss)
     pg_clipfrac = sum_of_sample_mean(pg_clipfrac)
@@ -1199,15 +1023,8 @@ def policy_loss_function(
 
     if args.use_tis:
         reported_loss["ois"] = sum_of_sample_mean(ois).clone().detach()
-<<<<<<< HEAD
-        # Assume all metrics are already cloned and detached
-        for metric_key, metric_value in tis_metrics.items():
-            key_name = f"{metric_key}"
-            reported_loss[key_name] = sum_of_sample_mean(metric_value)
-=======
         for metric_key, metric_value in tis_metrics.items():
             reported_loss[metric_key] = sum_of_sample_mean(metric_value).clone().detach()
->>>>>>> 2e08677 (MIS Integration)
 
     if cispo_stats is not None:
         reported_loss["cispo_ratio_mean"] = cispo_stats["ratio_mean"].clone().detach()

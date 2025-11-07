@@ -31,21 +31,14 @@ async def async_rm(args, sample: Sample, **kwargs):
     if args.custom_rm_path is not None:
         rm_function = load_function(args.custom_rm_path)
         return await rm_function(args, sample, **kwargs)
-<<<<<<< HEAD
-<<<<<<< HEAD
-
+    
     metadata = sample.metadata if isinstance(sample.metadata, dict) else {}
     # Check if this is evaluation mode - disable length penalty for evaluation
     is_evaluation = kwargs.get('evaluation', False)
     
     rm_type = (metadata.get("rm_type") or args.rm_type or "").strip()
->>>>>>> b53a26c (add length penalty for deepscaler)
-=======
-    # Check if this is evaluation mode - disable length penalty for evaluation
-    is_evaluation = kwargs.get('evaluation', False)
-    
-    rm_type = args.rm_type
->>>>>>> f75c7c5 (Slime length penalty (#1))
+
+
     response = sample.response
     label = sample.label
     if rm_type.startswith("boxed_"):

@@ -122,19 +122,10 @@ class MegatronTrainRayActor(TrainRayActor):
 
         self.prof = TrainProfiler(args)
 
-<<<<<<< HEAD
-<<<<<<< HEAD
-=======
-        # Q-Tuning reservoir to accumulate pruned samples until we can form full microbatches
-        self._q_tuning_sample_pool: dict | None = None
-
-=======
->>>>>>> bf1d677 (add CISPO loss & rm q tuning)
         # POLARIS components initialization
         self.reward_tracker, self.dynamic_replacer = init_polaris_components(args)
 
         Timer().start("train_wait")
->>>>>>> b25c8ed (POLARIS update)
         return start_rollout_id
 
     @torch.no_grad()
@@ -243,34 +234,12 @@ class MegatronTrainRayActor(TrainRayActor):
                 log_rollout_data(rollout_id, self.args, rollout_data)
                 return
 
-<<<<<<< HEAD
-        if self.role == "critic":
-            return self.train_critic(rollout_id, rollout_data)
-        else:
-            return self.train_actor(rollout_id, rollout_data)
-=======
         with timer("train"):
             with timer("data_preprocess"):
                 rollout_data = self._get_rollout_data(rollout_data_ref)
                 if "teacher_log_probs" in rollout_data:
                     rollout_data["ref_log_probs"] = rollout_data.pop("teacher_log_probs")
->>>>>>> c270d0b (clean)
 
-<<<<<<< HEAD
-    def train_critic(self, rollout_id: int, rollout_data: RolloutBatch) -> None:
-        # Q-Tuning: Dynamic data pruning based on PPL and Entropy
-        if self.args.enable_q_tuning:
-            with timer("q_tuning_pruning"):
-                from slime.utils.q_tuning_pruner import QTuningPruner
-
-                pruner = QTuningPruner(
-                    sample_keep_ratio=self.args.q_tuning_sample_keep_ratio,
-                    token_keep_ratio=self.args.q_tuning_token_keep_ratio,
-                    neighbor_lambda=self.args.q_tuning_neighbor_lambda,
-                    bisect_max_iter=self.args.q_tuning_bisect_max_iter,
-                )
-                rollout_data = pruner.prune_batch(self.model, rollout_data)
-=======
                 # POLARIS: Apply dynamic sampling and reward tracking
                 # This should be done before computing advantages_and_returns
                 polaris_stats = {}
@@ -290,26 +259,6 @@ class MegatronTrainRayActor(TrainRayActor):
                             Timer().start("train_wait")
                             return
 
-<<<<<<< HEAD
-                # Q-Tuning: Dynamic data pruning based on PPL and Entropy
-                if self.args.enable_q_tuning:
-                    with timer("q_tuning_pruning"):
-                        from slime.utils.q_tuning_pruner import QTuningPruner
-
-                        pruner = QTuningPruner(
-                            sample_keep_ratio=self.args.q_tuning_sample_keep_ratio,
-                            token_keep_ratio=self.args.q_tuning_token_keep_ratio,
-                            neighbor_lambda=self.args.q_tuning_neighbor_lambda,
-                            bisect_max_iter=self.args.q_tuning_bisect_max_iter,
-                        )
-                        pruned_data = pruner.prune_batch(self.model, rollout_data)
-
-                    rollout_data = self._q_tuning_prepare_batch(pruned_data)
-                    if rollout_data is None:
-                        print("[Q-Tuning] Accumulating samples; insufficient data for a full microbatch.")
-                        Timer().start("train_wait")
-                        return
->>>>>>> b25c8ed (POLARIS update)
 
         # Create data iterator for log_probs and train.
         data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
@@ -322,10 +271,6 @@ class MegatronTrainRayActor(TrainRayActor):
                 num_microbatches,
             )
         )
-=======
-                # Create data iterator for log_probs and train.
-                data_iterator, num_microbatches = get_data_iterator(self.args, self.model, rollout_data)
->>>>>>> bf1d677 (add CISPO loss & rm q tuning)
 
         if rollout_id >= self.args.num_critic_only_steps:
             sync_actor_critic_data(self.args, rollout_data, self._actor_critic_groups)
@@ -391,8 +336,6 @@ class MegatronTrainRayActor(TrainRayActor):
 
             log_rollout_data(rollout_id, self.args, rollout_data)
 
-<<<<<<< HEAD
-=======
             # Log POLARIS statistics
             if polaris_stats:
                 log_polaris_stats(rollout_id, self.args, polaris_stats)
@@ -400,7 +343,6 @@ class MegatronTrainRayActor(TrainRayActor):
             if self.args.use_pytorch_profiler and torch.distributed.get_rank() == 0 and self.prof is not None:
                 self.prof.step()
 
->>>>>>> b25c8ed (POLARIS update)
             # Train
             if self.args.use_routing_replay:
                 os.environ["ROUTING_REPLAY_STAGE"] = "replay_backward"

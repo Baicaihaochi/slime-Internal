@@ -1,8 +1,4 @@
-<<<<<<< HEAD
-from typing import Callable, Union
-=======
 from typing import Union
->>>>>>> b914ff6 (tis_clipfrac type conversion)
 
 import torch
 import torch.distributed as dist
@@ -181,8 +177,6 @@ def slice_log_prob_with_cp(
     total_length: int,
     response_length: int,
 ) -> Union[list[float], torch.Tensor]:
-<<<<<<< HEAD
-=======
     """
     Slice log probabilities for Context Parallel processing.
 
@@ -194,7 +188,6 @@ def slice_log_prob_with_cp(
     Returns:
         Sliced log probabilities matching the input type
     """
->>>>>>> b914ff6 (tis_clipfrac type conversion)
     assert len(log_prob) == response_length
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -208,10 +201,7 @@ def slice_log_prob_with_cp(
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
     chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]
 
-<<<<<<< HEAD
-=======
     # Handle both list and tensor types
->>>>>>> b914ff6 (tis_clipfrac type conversion)
     if isinstance(log_prob, list):
         return chunk_1 + chunk_2
     else:
