@@ -1,3 +1,5 @@
+from typing import Union
+
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
@@ -170,7 +172,22 @@ def slice_with_cp(tokens: torch.Tensor, pad_value):
     return torch.cat([tokens[start_1:end_1], tokens[start_2:end_2]])
 
 
-def slice_log_prob_with_cp(log_prob: list[float], total_length: int, response_length: int):
+def slice_log_prob_with_cp(
+    log_prob: Union[list[float], torch.Tensor],
+    total_length: int,
+    response_length: int,
+) -> Union[list[float], torch.Tensor]:
+    """
+    Slice log probabilities for Context Parallel processing.
+
+    Args:
+        log_prob: Log probabilities (list or tensor) of length response_length
+        total_length: Total sequence length (prompt + response)
+        response_length: Length of the response portion
+
+    Returns:
+        Sliced log probabilities matching the input type
+    """
     assert len(log_prob) == response_length
 
     cp_size = mpu.get_context_parallel_world_size()
@@ -183,4 +200,9 @@ def slice_log_prob_with_cp(log_prob: list[float], total_length: int, response_le
 
     chunk_1 = log_prob[logits_offset[0][0] - (prompt_length - 1) : logits_offset[0][1] - (prompt_length - 1)]
     chunk_2 = log_prob[logits_offset[1][0] - (prompt_length - 1) : logits_offset[1][1] - (prompt_length - 1)]
-    return chunk_1 + chunk_2
+
+    # Handle both list and tensor types
+    if isinstance(log_prob, list):
+        return chunk_1 + chunk_2
+    else:
+        return torch.cat([chunk_1, chunk_2], dim=0)

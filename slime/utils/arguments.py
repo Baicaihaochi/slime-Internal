@@ -1,6 +1,8 @@
 import os
 from typing import Any, Dict
 
+import yaml
+
 from transformers import AutoConfig
 
 from slime.backends.sglang_utils.arguments import add_sglang_arguments
@@ -195,6 +197,17 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--distill-teacher-url",
+                type=str,
+                default=None,
+                help=(
+                    "HTTP endpoint for an external teacher server that returns per-token log probabilities. "
+                    "The server is expected to accept JSON payloads with prompt and completion tokens and return "
+                    "a list of log probabilities for the completion tokens. If unset, on-policy distillation will "
+                    "not query an external teacher."
+                ),
+            )
+            parser.add_argument(
                 "--rollout-shuffle",
                 action="store_true",
                 default=False,
@@ -343,6 +356,15 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                     "which will be used as the prompt and the label respectively. "
                     "If you want to use a custom template, you can set --apply-chat-template to true, in that case, "
                     "the input should be the same structure as an openai message, e.g. [\{'role': 'user', 'content': 'blabla'\}]. "
+                ),
+            )
+            parser.add_argument(
+                "--rollout-data-path",
+                type=str,
+                default=None,
+                help=(
+                    "Alias for --prompt-data kept for POLARIS examples. "
+                    "When provided, sets the prompt dataset used for rollouts."
                 ),
             )
             parser.add_argument("--apply-chat-template", action="store_true", default=False)
@@ -529,6 +551,13 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--policy-objective",
+                type=str,
+                choices=["ppo", "cispo"],
+                default="ppo",
+                help="Policy gradient objective. PPO applies token clipping; CISPO clips importance weights.",
+            )
+            parser.add_argument(
                 "--custom-loss-function-path",
                 type=str,
                 default=None,
@@ -545,9 +574,38 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 help="Choose KL loss type: kl, k2, k3 low_var_kl",
             )
             parser.add_argument(
+                "--enable-on-policy-distill",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable on-policy distillation. Requires a teacher checkpoint via --ref-load. "
+                    "When set, the student advantages will be computed from the reverse KL between "
+                    "teacher and student log probabilities."
+                ),
+            )
+            parser.add_argument(
+                "--use-is-distill-loss",
+                action="store_true",
+                default=False,
+                help=(
+                    "Switch the on-policy distillation objective to the importance-sampling style loss used in "
+                    "Tinker Cookbook. When enabled, advantages are built as reward advantages minus KL penalty "
+                    "and applied directly to current log probabilities."
+                ),
+            )
+            parser.add_argument(
+                "--kl-penalty-coef",
+                type=float,
+                default=0.0,
+                help=(
+                    "Coefficient for the token-level KL penalty term used by the importance-sampling distillation loss. "
+                    "Effective only when --use-is-distill-loss is supplied."
+                ),
+            )
+            parser.add_argument(
                 "--advantage-estimator",
                 type=str,
-                choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline"],
+                choices=["grpo", "gspo", "reinforce_plus_plus", "reinforce_plus_plus_baseline", "reverse_kl"],
                 default="grpo",
             )
             parser.add_argument(
@@ -593,6 +651,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 ),
             )
             parser.add_argument(
+                "--cispo-eps-high",
+                type=float,
+                default=2.0,
+                help="Upper bound ε_high for CISPO importance-weight clipping (ratio limited to 1 + ε_high).",
+            )
+            parser.add_argument(
+                "--cispo-eps-low",
+                type=float,
+                default=0.0,
+                help="Lower bound ε_low for CISPO importance-weight clipping (set ≤0 to disable the lower clamp).",
+            )
+            parser.add_argument(
                 "--disable-grpo-std-normalization",
                 action="store_false",
                 dest="grpo_std_normalization",
@@ -632,6 +702,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 default=0,
                 help="Lower bound clipping threshold C for importance sampling ratios to control variance.",
             )
+            parser.add_argument(
+                "--custom-tis-function-path",
+                type=str,
+                default=None,
+                help="Path to the custom TIS function.",
+            )
             return parser
 
         # wandb
@@ -655,6 +731,12 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             parser.add_argument("--wandb-host", type=str, default=None)
             parser.add_argument("--wandb-team", type=str, default=None)
             parser.add_argument("--wandb-group", type=str, default=None)
+            parser.add_argument(
+                "--wandb-name",
+                type=str,
+                default=None,
+                help="Alias for --wandb-group preserved for POLARIS examples.",
+            )
             reset_arg(parser, "--wandb-project", type=str, default=None)
             parser.add_argument(
                 "--disable-wandb-random-suffix",
@@ -858,56 +940,8 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
                 "--loss-mask-type",
                 type=str,
                 default="qwen",
-                choices=["qwen", "distill_qwen"],
+                choices=["qwen", "qwen3", "distill_qwen"],
                 help="Loss mask type",
-            )
-            return parser
-
-        def add_q_tuning_arguments(parser):
-            """
-            Add Q-Tuning dynamic data pruning arguments.
-            Q-Tuning implements joint sample and token pruning based on the Error-Uncertainty (EU) Plane.
-            Reference: "Winning the Pruning Gamble" (arXiv:2509.23873)
-            """
-            parser.add_argument(
-                "--enable-q-tuning",
-                action="store_true",
-                default=False,
-                help="Enable Q-Tuning dynamic data pruning based on PPL and Entropy",
-            )
-            parser.add_argument(
-                "--q-tuning-sample-keep-ratio",
-                type=float,
-                default=0.5,
-                help=(
-                    "Target ratio of samples to keep after stage 1 (sample-level pruning). "
-                    "The bisection search will find thresholds to achieve this ratio."
-                ),
-            )
-            parser.add_argument(
-                "--q-tuning-token-keep-ratio",
-                type=float,
-                default=0.7,
-                help=(
-                    "Ratio of tokens to keep for Q2 samples in stage 2 (token-level pruning). "
-                    "Q4 samples are kept in full."
-                ),
-            )
-            parser.add_argument(
-                "--q-tuning-neighbor-lambda",
-                type=float,
-                default=0.5,
-                help=(
-                    "Smoothing coefficient for neighbor-aware token scoring. "
-                    "score_i = (1-λ)*PPL_i + λ*(PPL_{i-1}+PPL_{i+1})/2. "
-                    "Range: [0, 1], where 0 means no neighbor smoothing."
-                ),
-            )
-            parser.add_argument(
-                "--q-tuning-bisect-max-iter",
-                type=int,
-                default=10,
-                help="Maximum iterations for bisection search to find optimal thresholds",
             )
             return parser
 
@@ -941,6 +975,77 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
             )
             return parser
 
+        def add_polaris_arguments(parser):
+            """
+            Add POLARIS-style training tricks arguments.
+            Implements dynamic sampling and reward tracking from POLARIS paper.
+            """
+            parser.add_argument(
+                "--enable-polaris-dynamic-sampling",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable POLARIS dynamic sample replacement. "
+                    "This replaces trivial samples (reward=0 or 1) with medium-difficulty ones "
+                    "during training to improve data quality and training efficiency."
+                ),
+            )
+            parser.add_argument(
+                "--polaris-good-reward-min",
+                type=float,
+                default=0.0,
+                help="Minimum reward (exclusive) for 'good' samples in dynamic sampling.",
+            )
+            parser.add_argument(
+                "--polaris-good-reward-max",
+                type=float,
+                default=1.0,
+                help="Maximum reward (exclusive) for 'good' samples in dynamic sampling.",
+            )
+            parser.add_argument(
+                "--polaris-min-good-ratio",
+                type=float,
+                default=0.33,
+                help=(
+                    "Minimum ratio of good samples required to perform replacement. "
+                    "If less than this ratio, skip replacement and print warning."
+                ),
+            )
+            parser.add_argument(
+                "--enable-polaris-reward-tracking",
+                action="store_true",
+                default=False,
+                help=(
+                    "Enable reward tracking to JSONL files for post-training analysis. "
+                    "This enables difficulty-based data filtering between training stages."
+                ),
+            )
+            parser.add_argument(
+                "--polaris-reward-tracking-dir",
+                type=str,
+                default=None,
+                help=(
+                    "Directory to save reward tracking files. "
+                    "Defaults to the same directory as the training data."
+                ),
+            )
+            parser.add_argument(
+                "--polaris-verbose",
+                action="store_true",
+                default=True,
+                help="Print verbose information about POLARIS operations.",
+            )
+            parser.add_argument(
+                "--polaris-skip-batch-when-insufficient",
+                action="store_true",
+                default=False,
+                help=(
+                    "Skip the current batch when insufficient medium-difficulty samples are available "
+                    "(i.e., good ratio <= min_good_ratio). This matches verl's behavior."
+                ),
+            )
+            return parser
+
         # Add custom arguments in front to prevent overwritten some slime arguments.
         if add_custom_arguments is not None:
             parser = add_custom_arguments(parser)
@@ -956,12 +1061,18 @@ def get_slime_extra_args_provider(add_custom_arguments=None):
         parser = add_network_arguments(parser)
         parser = add_reward_model_arguments(parser)
         parser = add_rollout_buffer_arguments(parser)
-        parser = add_q_tuning_arguments(parser)
+        parser = add_polaris_arguments(parser)
         parser = add_ci_arguments(parser)
 
         # For megatron
         parser = add_custom_megatron_plugins_arguments(parser)
         try:
+            parser.add_argument(
+                "--custom-config-path",
+                type=str,
+                default=None,
+                help="Path to the YAML config for custom function arguments.",
+            )
             parser.add_argument("--padded-vocab-size", type=int, default=None)
         except:
             pass
@@ -1036,9 +1147,24 @@ def parse_args(add_custom_arguments=None):
 
 
 def slime_validate_args(args):
-    if args.kl_coef != 0 or args.use_kl_loss:
-        if not os.path.exists(args.ref_load):
-            raise FileNotFoundError(f"ref_load {args.ref_load} does not exist, please check the path.")
+    # Harmonize backward compatibility aliases used in POLARIS examples.
+    if getattr(args, "rollout_data_path", None) and getattr(args, "prompt_data", None) is None:
+        args.prompt_data = args.rollout_data_path
+    elif getattr(args, "prompt_data", None) is not None and getattr(args, "rollout_data_path", None) is None:
+        args.rollout_data_path = args.prompt_data
+
+    if getattr(args, "wandb_name", None):
+        if getattr(args, "wandb_group", None) is None:
+            args.wandb_group = args.wandb_name
+    else:
+        args.wandb_name = getattr(args, "wandb_group", None)
+
+    if args.kl_coef != 0 or args.use_kl_loss or (args.enable_on_policy_distill and args.distill_teacher_url is None):
+        if not args.ref_load or not os.path.exists(args.ref_load):
+            raise FileNotFoundError(
+                f"ref_load {args.ref_load} does not exist, please check the path. "
+                "It is required when using KL rewards without an external teacher."
+            )
 
         if not os.path.exists(os.path.join(args.ref_load, "latest_checkpointed_iteration.txt")):
             print(
@@ -1077,6 +1203,27 @@ def slime_validate_args(args):
             "The 'reinforce_plus_plus' and 'reinforce_plus_plus_baseline' advantage estimators "
             "require advantage normalization. Please add `--normalize-advantages` to your command."
         )
+
+    if args.enable_on_policy_distill:
+        if args.advantage_estimator != "reverse_kl":
+            if args.advantage_estimator == "grpo":
+                print(
+                    "[On-Policy Distill] Overriding --advantage-estimator to 'reverse_kl' "
+                    "to use teacher log-prob advantages."
+                )
+                args.advantage_estimator = "reverse_kl"
+            else:
+                raise ValueError(
+                    "On-policy distillation requires --advantage-estimator to be 'reverse_kl'. "
+                    f"Got '{args.advantage_estimator}'."
+                )
+        if not args.compute_advantages_and_returns:
+            raise ValueError(
+                "On-policy distillation requires computing advantages. "
+                "Please omit --disable-compute-advantages-and-returns."
+            )
+        if args.loss_type != "policy_loss":
+            raise ValueError("On-policy distillation is only supported with --loss-type policy_loss.")
 
     if args.use_dynamic_batch_size:
         assert args.max_tokens_per_gpu is not None, "max_tokens_per_gpu must be set when use_dynamic_batch_size is set"
@@ -1167,6 +1314,15 @@ def slime_validate_args(args):
             "num_epoch is not set, but num_rollout is not set, " "please set --num-rollout or --num-epoch"
         )
 
+    if getattr(args, "custom_config_path", None):
+        with open(args.custom_config_path, "r") as f:
+            data = yaml.safe_load(f) or {}
+        for k, v in data.items():
+            if not hasattr(args, k):
+                setattr(args, k, v)
+            else:
+                print(f"Warning: Argument {k} is already set to {getattr(args, k)}, will not override with {v}.")
+
 
 def hf_validate_args(args, hf_config):
     equal = lambda x, y: x == y
@@ -1175,7 +1331,7 @@ def hf_validate_args(args, hf_config):
         ("num_attention_heads", "num_attention_heads", equal),
         ("num_hidden_layers", "num_layers", equal),
         ("intermediate_size", "ffn_hidden_size", equal),
-        ("tie_word_embeddings", "untie_embeddings_and_output_weights", lambda x, y: not x == y),
+        ("tie_word_embeddings", "untie_embeddings_and_output_weights", None),
         ("rms_norm_eps", "norm_epsilon", equal),
         ("rope_theta", "rotary_base", equal),
     ]:
